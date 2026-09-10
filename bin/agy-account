@@ -188,13 +188,9 @@ add_account() {
     [[ -f "$TOKEN_FILE" ]] && mv "$TOKEN_FILE" "$tmp_backup/"
     [[ -f "$CRED_FILE" ]] && mv "$CRED_FILE" "$tmp_backup/"
 
-    local agy_pid=""
-    local AGY_AUTH_LOG="$tmp_backup/agy_auth.log"
-
     # Trap to restore token if user cancels with Ctrl+C
     cleanup_on_interrupt() {
         echo -e "\n${YELLOW}Operation cancelled. Restoring previous account state...${NC}"
-        [[ -n "$agy_pid" ]] && kill "$agy_pid" 2>/dev/null || true
         [[ -f "$tmp_backup/antigravity-oauth-token" && ! -f "$TOKEN_FILE" ]] && mv "$tmp_backup/antigravity-oauth-token" "$TOKEN_FILE"
         [[ -f "$tmp_backup/gemini-credentials.json" && ! -f "$CRED_FILE" ]] && mv "$tmp_backup/gemini-credentials.json" "$CRED_FILE"
         rm -rf "$tmp_backup"
@@ -203,56 +199,26 @@ add_account() {
     trap cleanup_on_interrupt INT TERM
 
     echo ""
-    echo -e "${BLUE}Launching AGY to trigger OAuth login...${NC}"
-    echo -e "${YELLOW}A browser/auth URL will open. Please complete login for the NEW account.${NC}"
+    echo -e "${BLUE}=== Starting AGY Authentication ===${NC}"
+    echo -e "${YELLOW}1. Open the URL shown below in your browser.${NC}"
+    echo -e "${YELLOW}2. Complete Google login.${NC}"
+    echo -e "${YELLOW}3. If an authorization code is given, paste it here and press Enter.${NC}"
     echo ""
 
-    # Launch AGY non-interactively to trigger OAuth listener and prompt
-    "$AGY_BIN" --print "." > "$AGY_AUTH_LOG" 2>&1 &
-    agy_pid=$!
+    # Run AGY in foreground with stdin connected to terminal for pasting code
+    local agy_exit=0
+    "$AGY_BIN" --print "." || agy_exit=$?
 
-    echo -e "Waiting for authentication... (timeout: 3 minutes)"
-    echo -e "${YELLOW}(Complete the login in your browser, then return here)${NC}"
-    echo ""
-
-    # Wait loop: check for new token file and stream any output
-    local count=0
-    local max_wait=90  # 90 * 2s = 3 minutes
-    local shown_lines=0
-
-    while [[ ! -f "$TOKEN_FILE" ]]; do
-        sleep 2
-        count=$((count + 1))
-
-        # Stream new output lines (contains browser URL / instructions)
-        if [[ -f "$AGY_AUTH_LOG" ]]; then
-            local current_lines=$(wc -l < "$AGY_AUTH_LOG" 2>/dev/null || echo 0)
-            if (( current_lines > shown_lines )); then
-                tail -n +$((shown_lines + 1)) "$AGY_AUTH_LOG" 2>/dev/null || true
-                shown_lines=$current_lines
-            fi
-        fi
-
-        if (( count % 5 == 0 )) && (( shown_lines == 0 )); then
-            echo -n "."
-        fi
-
-        if [[ $count -ge $max_wait ]]; then
-            echo ""
-            echo -e "${RED}Timeout: No login detected after 3 minutes.${NC}"
-            kill "$agy_pid" 2>/dev/null || true
-
-            # Restore original token/creds
-            [[ -f "$tmp_backup/antigravity-oauth-token" ]] && mv "$tmp_backup/antigravity-oauth-token" "$TOKEN_FILE"
-            [[ -f "$tmp_backup/gemini-credentials.json" ]] && mv "$tmp_backup/gemini-credentials.json" "$CRED_FILE"
-            rm -rf "$tmp_backup"
-            trap - INT TERM
-            exit 1
-        fi
-    done
-
-    echo ""
-    kill "$agy_pid" 2>/dev/null || true
+    # Verify if new token file was created
+    if [[ ! -f "$TOKEN_FILE" ]]; then
+        echo ""
+        echo -e "${RED}Authentication failed, was cancelled, or timed out.${NC}"
+        [[ -f "$tmp_backup/antigravity-oauth-token" ]] && mv "$tmp_backup/antigravity-oauth-token" "$TOKEN_FILE"
+        [[ -f "$tmp_backup/gemini-credentials.json" ]] && mv "$tmp_backup/gemini-credentials.json" "$CRED_FILE"
+        rm -rf "$tmp_backup"
+        trap - INT TERM
+        exit 1
+    fi
 
     # Verify the new token
     local new_email
