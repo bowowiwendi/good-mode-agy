@@ -49,6 +49,34 @@ SETTINGS_FILE="$AGY_CLI_DIR/settings.json"
 mkdir -p "$ACCOUNTS_DIR"
 
 # ------------------------------------------------------------------------------
+# Helper: Termux & Terminal Notifications
+# ------------------------------------------------------------------------------
+send_termux_notification() {
+    local title="$1"
+    local content="$2"
+    local priority="${3:-high}"
+
+    # 1. Termux API notification if installed
+    if command -v termux-notification &>/dev/null; then
+        termux-notification \
+            --title "$title" \
+            --content "$content" \
+            --id "gma_notify" \
+            --priority "$priority" \
+            --icon "sync" 2>/dev/null || true
+    fi
+
+    # 2. Termux Toast if installed
+    if command -v termux-toast &>/dev/null; then
+        termux-toast "$title: $content" 2>/dev/null || true
+    fi
+
+    # 3. Terminal Notification Escape sequences (OSC 9 & OSC 777) & Bell
+    printf '\e]9;%s: %s\a' "$title" "$content" 2>/dev/null || true
+    printf '\a' 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
 # Helper: Locate working agy binary
 # ------------------------------------------------------------------------------
 get_agy_binary() {
@@ -74,7 +102,7 @@ get_agy_binary() {
 }
 
 # ------------------------------------------------------------------------------
-# Helper: Decode JWT
+# Helper: Decode JWT Email
 # ------------------------------------------------------------------------------
 decode_jwt_email() {
     local token="$1"
@@ -134,33 +162,121 @@ sanitize_email() {
 
 # ------------------------------------------------------------------------------
 # Helper: Get all saved accounts as an array
-# Output format per line: email|dir
+# Output format per line: email|dir|alias|model|auto_rotate
 # ------------------------------------------------------------------------------
 get_saved_accounts() {
-    local list=()
-    if [[ -d "$ACCOUNTS_DIR" ]]; then
+    if [[ ! -d "$ACCOUNTS_DIR" ]]; then
+        return
+    fi
+
+    if command -v python3 &>/dev/null; then
+        python3 -c "
+import os, json, sys
+
+accounts_dir = '$ACCOUNTS_DIR'
+items = []
+if os.path.exists(accounts_dir):
+    for name in os.listdir(accounts_dir):
+        dir_path = os.path.join(accounts_dir, name)
+        if os.path.isdir(dir_path):
+            meta_path = os.path.join(dir_path, 'meta.json')
+            email, alias, model, auto_rotate = 'unknown', '', '', 'true'
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                    email = meta.get('email', 'unknown')
+                    alias = meta.get('alias', '')
+                    model = meta.get('model', '')
+                    auto_rotate = 'true' if meta.get('auto_rotate', True) else 'false'
+                except Exception:
+                    pass
+            if email != 'unknown':
+                items.append((email, dir_path, alias, model, auto_rotate))
+
+items.sort(key=lambda x: x[0])
+for email, dir_path, alias, model, auto_rotate in items:
+    print(f'{email}|{dir_path}|{alias}|{model}|{auto_rotate}')
+" 2>/dev/null || true
+    else
+        # Pure bash fallback
         for dir in "$ACCOUNTS_DIR"/*; do
             if [[ -d "$dir" ]]; then
                 local meta_email="unknown"
+                local alias=""
+                local model=""
+                local auto_rotate="true"
                 if [[ -f "$dir/meta.json" ]]; then
-                    if command -v python3 &>/dev/null; then
-                        meta_email=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('email', 'unknown'))" < "$dir/meta.json" 2>/dev/null || true)
-                    else
-                        meta_email=$(grep -oP '"email"\s*:\s*"\K[^"]+' "$dir/meta.json" 2>/dev/null || true)
-                    fi
+                    meta_email=$(grep -oP '"email"\s*:\s*"\K[^"]+' "$dir/meta.json" 2>/dev/null || echo "unknown")
+                    alias=$(grep -oP '"alias"\s*:\s*"\K[^"]+' "$dir/meta.json" 2>/dev/null || true)
+                    model=$(grep -oP '"model"\s*:\s*"\K[^"]+' "$dir/meta.json" 2>/dev/null || true)
                 fi
                 if [[ "$meta_email" != "unknown" ]]; then
-                    list+=("$meta_email|$dir")
+                    echo "$meta_email|$dir|$alias|$model|$auto_rotate"
                 fi
             fi
-        done
+        done | sort
     fi
-    # Sort accounts by email
-    IFS=$'\n' sorted=($(sort <<<"${list[*]}"))
-    unset IFS
-    for acc in "${sorted[@]}"; do
-        [[ -n "$acc" ]] && echo "$acc"
-    done
+}
+
+# ------------------------------------------------------------------------------
+# Helper: Read account metadata
+# ------------------------------------------------------------------------------
+get_account_meta() {
+    local target_email="$1"
+    local safe_email
+    safe_email=$(sanitize_email "$target_email")
+    local meta_path="$ACCOUNTS_DIR/$safe_email/meta.json"
+    if [[ -f "$meta_path" ]] && command -v python3 &>/dev/null; then
+        python3 -c "
+import json
+with open('$meta_path') as f:
+    d = json.load(f)
+print(f\"{d.get('alias','')}|{d.get('model','')}|{d.get('effort','')}|{d.get('auto_rotate', True)}|{d.get('notes','')}\")
+" 2>/dev/null || echo "|||True|"
+    else
+        echo "|||True|"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Helper: Save account metadata
+# ------------------------------------------------------------------------------
+update_account_meta() {
+    local target_email="$1"
+    local key="$2"
+    local value="$3"
+    local safe_email
+    safe_email=$(sanitize_email "$target_email")
+    local prof_dir="$ACCOUNTS_DIR/$safe_email"
+    mkdir -p "$prof_dir"
+    local meta_path="$prof_dir/meta.json"
+
+    if command -v python3 &>/dev/null; then
+        python3 -c "
+import json, os, datetime
+
+meta_path = '$meta_path'
+data = {'email': '$target_email'}
+if os.path.exists(meta_path):
+    try:
+        with open(meta_path) as f:
+            data = json.load(f)
+    except Exception:
+        pass
+
+val = '$value'
+if '$key' == 'auto_rotate':
+    data['$key'] = (val.lower() in ('true', '1', 'yes', 'on'))
+else:
+    data['$key'] = val
+
+data['updated_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+with open(meta_path, 'w') as f:
+    json.dump(data, f, indent=2)
+"
+    fi
 }
 
 # ------------------------------------------------------------------------------
@@ -182,12 +298,36 @@ list_accounts() {
     else
         local idx=1
         for acc in "${accounts[@]}"; do
-            local email="${acc%%|*}"
+            local email
+            local alias
+            local model
+            local auto_rot
+            email=$(echo "$acc" | cut -d'|' -f1)
+            alias=$(echo "$acc" | cut -d'|' -f3)
+            model=$(echo "$acc" | cut -d'|' -f4)
+            auto_rot=$(echo "$acc" | cut -d'|' -f5)
+
             local marker="  "
             if [[ "$email" == "$current" && "$current" != "none" ]]; then
                 marker="${GREEN}* ${NC}"
             fi
-            echo -e "${marker}${BOLD}${idx}.${NC} ${email}"
+
+            local alias_str=""
+            if [[ -n "$alias" ]]; then
+                alias_str=" ${MAGENTA}[${alias}]${NC}"
+            fi
+
+            local model_str=""
+            if [[ -n "$model" ]]; then
+                model_str=" ${CYAN}(${model})${NC}"
+            fi
+
+            local rot_str=""
+            if [[ "$auto_rot" == "false" ]]; then
+                rot_str=" ${YELLOW}[No-Rotate]${NC}"
+            fi
+
+            echo -e "${marker}${BOLD}${idx}.${NC} ${email}${alias_str}${model_str}${rot_str}"
             idx=$((idx + 1))
         done
     fi
@@ -220,7 +360,17 @@ current_account() {
     if [[ "$email" == "none" ]]; then
         echo -e "${YELLOW}Tidak ada akun aktif.${NC}"
     else
-        echo -e "Akun Aktif: ${GREEN}${BOLD}$email${NC}"
+        local meta
+        meta=$(get_account_meta "$email")
+        local alias
+        alias=$(echo "$meta" | cut -d'|' -f1)
+        local model
+        model=$(echo "$meta" | cut -d'|' -f2)
+
+        local extra=""
+        [[ -n "$alias" ]] && extra+=" [Alias: $alias]"
+        [[ -n "$model" ]] && extra+=" [Model: $model]"
+        echo -e "Akun Aktif: ${GREEN}${BOLD}$email${NC}${CYAN}$extra${NC}"
     fi
 }
 
@@ -241,9 +391,26 @@ backup_current() {
         [[ -f "$GOOGLE_ACC_FILE" ]] && cp -p "$GOOGLE_ACC_FILE" "$prof_dir/google_accounts.json"
         [[ -f "$SETTINGS_FILE" ]] && cp -p "$SETTINGS_FILE" "$prof_dir/settings.json"
         
-        local now
-        now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-        echo "{\"email\":\"$email\",\"updated_at\":\"$now\"}" > "$prof_dir/meta.json"
+        # Preserve existing meta fields (alias, model, etc)
+        local meta_file="$prof_dir/meta.json"
+        if [[ -f "$meta_file" ]] && command -v python3 &>/dev/null; then
+            python3 -c "
+import json, datetime
+try:
+    with open('$meta_file') as f:
+        d = json.load(f)
+except Exception:
+    d = {}
+d['email'] = '$email'
+d['updated_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+with open('$meta_file', 'w') as f:
+    json.dump(d, f, indent=2)
+"
+        else
+            local now
+            now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            echo "{\"email\":\"$email\",\"updated_at\":\"$now\"}" > "$meta_file"
+        fi
     fi
 }
 
@@ -267,8 +434,8 @@ save_account() {
 switch_account() {
     local target="${1:-}"
     if [[ -z "$target" ]]; then
-        echo -e "${RED}Error: Masukkan nomor urut (index) atau email akun yang ingin digunakan.${NC}"
-        echo -e "Contoh: ${CYAN}gma switch 1${NC} atau ${CYAN}gma switch user@gmail.com${NC}"
+        echo -e "${RED}Error: Masukkan nomor urut (index), alias, atau email akun yang ingin digunakan.${NC}"
+        echo -e "Contoh: ${CYAN}gma switch 1${NC} atau ${CYAN}gma switch primary${NC} atau ${CYAN}gma switch user@gmail.com${NC}"
         exit 1
     fi
 
@@ -284,14 +451,25 @@ switch_account() {
 
     local target_dir=""
     local target_email=""
+    local target_alias=""
+    local target_model=""
     
     local idx=1
     for acc in "${accounts[@]}"; do
-        local email="${acc%%|*}"
-        local dir="${acc#*|}"
-        if [[ "$target" == "$email" || "$target" == "$idx" ]]; then
+        local email
+        local dir
+        local alias
+        local model
+        email=$(echo "$acc" | cut -d'|' -f1)
+        dir=$(echo "$acc" | cut -d'|' -f2)
+        alias=$(echo "$acc" | cut -d'|' -f3)
+        model=$(echo "$acc" | cut -d'|' -f4)
+
+        if [[ "$target" == "$email" || "$target" == "$idx" || ( -n "$alias" && "${target,,}" == "${alias,,}" ) ]]; then
             target_dir="$dir"
             target_email="$email"
+            target_alias="$alias"
+            target_model="$model"
             break
         fi
         idx=$((idx + 1))
@@ -303,7 +481,9 @@ switch_account() {
         exit 1
     fi
     
-    echo -e "${BLUE}Mengganti akun aktif ke: ${BOLD}$target_email${NC}..."
+    local disp_name="$target_email"
+    [[ -n "$target_alias" ]] && disp_name="$target_email [$target_alias]"
+    echo -e "${BLUE}Mengganti akun aktif ke: ${BOLD}$disp_name${NC}..."
     
     # Backup current session before switching
     backup_current
@@ -332,8 +512,27 @@ switch_account() {
     else
         echo "{\"active\": null, \"old\": [\"$target_email\"]}" > "$GOOGLE_ACC_FILE"
     fi
+
+    # Apply per-account custom model to settings.json if configured
+    if [[ -n "$target_model" && -f "$SETTINGS_FILE" ]] && command -v python3 &>/dev/null; then
+        python3 -c "
+import json
+try:
+    with open('$SETTINGS_FILE') as f:
+        s = json.load(f)
+    s['model'] = '$target_model'
+    with open('$SETTINGS_FILE', 'w') as f:
+        json.dump(s, f, indent=2)
+except Exception:
+    pass
+" 2>/dev/null || true
+        echo -e "✓ Model otomatis diatur ke: ${CYAN}${target_model}${NC}"
+    fi
     
-    echo -e "${GREEN}✓ Berhasil beralih ke: ${BOLD}$target_email${NC}"
+    echo -e "${GREEN}✓ Berhasil beralih ke: ${BOLD}$disp_name${NC}"
+
+    # Termux notification
+    send_termux_notification "🚀 GMA: Akun Aktif Berganti" "Beralih ke: $disp_name" "high"
 }
 
 # ------------------------------------------------------------------------------
@@ -351,26 +550,237 @@ next_account() {
         return 0
     fi
 
+    # Filter accounts enabled for auto-rotation
+    local rot_accounts=()
+    for acc in "${accounts[@]}"; do
+        local auto_rot
+        auto_rot=$(echo "$acc" | cut -d'|' -f5)
+        if [[ "$auto_rot" != "false" ]]; then
+            rot_accounts+=("$acc")
+        fi
+    done
+
+    if [[ ${#rot_accounts[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}Semua akun dinonaktifkan dari auto-rotate. Menggunakan seluruh akun tersimpan...${NC}"
+        rot_accounts=("${accounts[@]}")
+    fi
+
+    local rot_total=${#rot_accounts[@]}
     local current
     current=$(get_current_email)
-    local current_idx=0
+    local current_rot_idx=0
 
-    for i in "${!accounts[@]}"; do
-        local acc_email="${accounts[$i]%%|*}"
+    for i in "${!rot_accounts[@]}"; do
+        local acc_email
+        acc_email=$(echo "${rot_accounts[$i]}" | cut -d'|' -f1)
         if [[ "$acc_email" == "$current" ]]; then
-            current_idx=$((i + 1))
+            current_rot_idx=$((i + 1))
             break
         fi
     done
 
     # Next index with round-robin wrap around
-    local next_idx=$(( (current_idx % total) + 1 ))
-    local next_acc="${accounts[$((next_idx - 1))]}"
-    local next_email="${next_acc%%|*}"
+    local next_rot_idx=$(( (current_rot_idx % rot_total) + 1 ))
+    local next_acc="${rot_accounts[$((next_rot_idx - 1))]}"
+    local next_email
+    local next_alias
+    next_email=$(echo "$next_acc" | cut -d'|' -f1)
+    next_alias=$(echo "$next_acc" | cut -d'|' -f3)
 
-    echo -e "${CYAN}🔄 [Auto-Rotate] Beralih dari (#${current_idx:-?}) ke (#${next_idx}/${total}): ${BOLD}${next_email}${NC}"
-    switch_account "$next_idx" >/dev/null
-    echo -e "${GREEN}✓ Akun aktif sekarang: ${BOLD}${next_email}${NC} (${next_idx}/${total})"
+    local disp_target="$next_email"
+    [[ -n "$next_alias" ]] && disp_target="$next_email [$next_alias]"
+
+    echo -e "${CYAN}🔄 [Auto-Rotate] Beralih ke (${next_rot_idx}/${rot_total}): ${BOLD}${disp_target}${NC}"
+    switch_account "$next_email" >/dev/null
+    echo -e "${GREEN}✓ Akun aktif sekarang: ${BOLD}${disp_target}${NC} (${next_rot_idx}/${rot_total})"
+
+    # Termux notification
+    send_termux_notification "🔄 GMA Auto-Switch" "Akun aktif sekarang: $disp_target" "high"
+}
+
+# ------------------------------------------------------------------------------
+# Command: config / set (Configure per-account settings)
+# ------------------------------------------------------------------------------
+config_account() {
+    local target="${1:-}"
+
+    if [[ -z "$target" ]]; then
+        # Interactive account selection for config
+        list_accounts
+        echo ""
+        echo -n "Masukkan nomor urut, email, atau alias akun yang ingin dikonfigurasi: "
+        read -r target
+        if [[ -z "$target" ]]; then
+            echo "Dibatalkan."
+            return 0
+        fi
+    fi
+
+    # Find account
+    local accounts=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && accounts+=("$line")
+    done < <(get_saved_accounts)
+
+    local target_email=""
+    local idx=1
+    for acc in "${accounts[@]}"; do
+        local email
+        local alias
+        email=$(echo "$acc" | cut -d'|' -f1)
+        alias=$(echo "$acc" | cut -d'|' -f3)
+        if [[ "$target" == "$email" || "$target" == "$idx" || ( -n "$alias" && "${target,,}" == "${alias,,}" ) ]]; then
+            target_email="$email"
+            break
+        fi
+        idx=$((idx + 1))
+    done
+
+    if [[ -z "$target_email" ]]; then
+        echo -e "${RED}Akun '$target' tidak ditemukan.${NC}"
+        return 1
+    fi
+
+    shift || true
+
+    # Check for CLI flags: --alias, --model, --effort, --rotate, --notes
+    local new_alias=""
+    local new_model=""
+    local new_effort=""
+    local new_rotate=""
+    local new_notes=""
+    local has_flags=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --alias) new_alias="$2"; has_flags=1; shift 2 ;;
+            --model) new_model="$2"; has_flags=1; shift 2 ;;
+            --effort) new_effort="$2"; has_flags=1; shift 2 ;;
+            --rotate) new_rotate="$2"; has_flags=1; shift 2 ;;
+            --notes) new_notes="$2"; has_flags=1; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ $has_flags -eq 1 ]]; then
+        [[ -n "$new_alias" ]] && update_account_meta "$target_email" "alias" "$new_alias"
+        [[ -n "$new_model" ]] && update_account_meta "$target_email" "model" "$new_model"
+        [[ -n "$new_effort" ]] && update_account_meta "$target_email" "effort" "$new_effort"
+        [[ -n "$new_rotate" ]] && update_account_meta "$target_email" "auto_rotate" "$new_rotate"
+        [[ -n "$new_notes" ]] && update_account_meta "$target_email" "notes" "$new_notes"
+        echo -e "${GREEN}✓ Konfigurasi akun ${BOLD}$target_email${NC}${GREEN} berhasil diperbarui!${NC}"
+        return 0
+    fi
+
+    # Interactive Configuration Wizard
+    local meta
+    meta=$(get_account_meta "$target_email")
+    local cur_alias
+    local cur_model
+    local cur_effort
+    local cur_rotate
+    local cur_notes
+    cur_alias=$(echo "$meta" | cut -d'|' -f1)
+    cur_model=$(echo "$meta" | cut -d'|' -f2)
+    cur_effort=$(echo "$meta" | cut -d'|' -f3)
+    cur_rotate=$(echo "$meta" | cut -d'|' -f4)
+    cur_notes=$(echo "$meta" | cut -d'|' -f5)
+
+    echo ""
+    echo -e "${BLUE}=== ⚙️  Konfigurasi Kustom Akun ===${NC}"
+    echo -e "Akun: ${GREEN}${BOLD}$target_email${NC}"
+    echo "------------------------------------------------------------"
+    
+    # 1. Alias
+    echo -e "Alias / Label saat ini: ${MAGENTA}${cur_alias:-[Belum diatur]}${NC}"
+    echo -n "Masukkan alias baru (tekan Enter untuk tidak mengubah, '-' untuk hapus): "
+    read -r inp_alias
+    if [[ "$inp_alias" == "-" ]]; then
+        update_account_meta "$target_email" "alias" ""
+        echo "  ✓ Alias dihapus."
+    elif [[ -n "$inp_alias" ]]; then
+        update_account_meta "$target_email" "alias" "$inp_alias"
+        echo "  ✓ Alias diatur ke: $inp_alias"
+    fi
+
+    # 2. Model
+    echo ""
+    echo -e "Default Model saat ini: ${CYAN}${cur_model:-[Bawaan Sistem]}${NC}"
+    echo "Pilihan model populer:"
+    echo "  1) Gemini 3.8 Flash (High)"
+    echo "  2) Gemini 3.8 Flash (Medium)"
+    echo "  3) Gemini 3.7 Flash (High)"
+    echo "  4) Gemini 3.1 Pro (High)"
+    echo "  5) Claude Sonnet 4.6 (Thinking)"
+    echo "  6) Custom input"
+    echo "  0) Hapus custom model (gunakan default AGY)"
+    echo -n "Pilih opsi [0-6, Enter untuk lewati]: "
+    read -r inp_mod_opt
+    case "$inp_mod_opt" in
+        1) update_account_meta "$target_email" "model" "Gemini 3.8 Flash (High)"; echo "  ✓ Model diatur ke: Gemini 3.8 Flash (High)" ;;
+        2) update_account_meta "$target_email" "model" "Gemini 3.8 Flash (Medium)"; echo "  ✓ Model diatur ke: Gemini 3.8 Flash (Medium)" ;;
+        3) update_account_meta "$target_email" "model" "Gemini 3.7 Flash (High)"; echo "  ✓ Model diatur ke: Gemini 3.7 Flash (High)" ;;
+        4) update_account_meta "$target_email" "model" "Gemini 3.1 Pro (High)"; echo "  ✓ Model diatur ke: Gemini 3.1 Pro (High)" ;;
+        5) update_account_meta "$target_email" "model" "Claude Sonnet 4.6 (Thinking)"; echo "  ✓ Model diatur ke: Claude Sonnet 4.6 (Thinking)" ;;
+        6) 
+            echo -n "Masukkan nama model persis: "
+            read -r custom_m
+            [[ -n "$custom_m" ]] && update_account_meta "$target_email" "model" "$custom_m"
+            ;;
+        0) update_account_meta "$target_email" "model" ""; echo "  ✓ Custom model dihapus." ;;
+        *) ;;
+    esac
+
+    # 3. Auto-Rotate Toggle
+    echo ""
+    local rot_disp="Aktif"
+    [[ "$cur_rotate" == "False" || "$cur_rotate" == "false" ]] && rot_disp="Nonaktif"
+    echo -e "Status Auto-Rotate saat ini: ${YELLOW}$rot_disp${NC}"
+    echo -n "Sertakan akun ini dalam rotasi otomatis saat kuota habis? (y/n, Enter untuk lewati): "
+    read -r inp_rot
+    if [[ "$inp_rot" =~ ^[Yy]$ ]]; then
+        update_account_meta "$target_email" "auto_rotate" "true"
+        echo "  ✓ Auto-rotate diaktifkan untuk akun ini."
+    elif [[ "$inp_rot" =~ ^[Nn]$ ]]; then
+        update_account_meta "$target_email" "auto_rotate" "false"
+        echo "  ✓ Auto-rotate dinonaktifkan (akun tidak akan tersentuh saat rotasi otomatis)."
+    fi
+
+    # 4. Notes
+    echo ""
+    echo -e "Catatan saat ini: ${cur_notes:-[Kosong]}"
+    echo -n "Catatan baru (tekan Enter untuk lewati, '-' untuk hapus): "
+    read -r inp_notes
+    if [[ "$inp_notes" == "-" ]]; then
+        update_account_meta "$target_email" "notes" ""
+    elif [[ -n "$inp_notes" ]]; then
+        update_account_meta "$target_email" "notes" "$inp_notes"
+    fi
+
+    echo ""
+    echo -e "${GREEN}✓ Konfigurasi akun ${BOLD}$target_email${NC}${GREEN} selesai disimpan!${NC}"
+}
+
+# ------------------------------------------------------------------------------
+# Command: test-notif
+# ------------------------------------------------------------------------------
+test_notification() {
+    echo -e "${BLUE}=== 🔔 Menguji Notifikasi Termux ===${NC}"
+    
+    local has_termux_api=0
+    if command -v termux-notification &>/dev/null; then
+        has_termux_api=1
+        echo -e "${GREEN}✓ Paket 'termux-api' ditemukan di Termux.${NC}"
+    else
+        echo -e "${YELLOW}ℹ️  'termux-notification' belum terpasang.${NC}"
+        echo -e "Agar notifikasi pop-up muncul di status bar Android, jalankan:"
+        echo -e "  ${CYAN}pkg install termux-api${NC}"
+        echo -e "Dan instal aplikasi pendamping ${BOLD}Termux:API${NC} dari F-Droid atau GitHub."
+        echo ""
+    fi
+
+    send_termux_notification "🚀 GMA (Good Mode AGY)" "Uji coba notifikasi Termux berhasil! Sistem GMA siap beroperasi." "high"
+    echo -e "${GREEN}✓ Sinyal notifikasi telah dikirimkan!${NC}"
 }
 
 # ------------------------------------------------------------------------------
@@ -453,9 +863,20 @@ add_account() {
     echo -e "${GREEN}✓ Berhasil login dengan akun: ${BOLD}$new_email${NC}"
     backup_current
     echo -e "${GREEN}✓ Akun baru berhasil disimpan ke profil GMA!${NC}"
+
     echo ""
-    echo -e "Gunakan ${CYAN}gma switch <nomor|email>${NC} atau ${CYAN}gma next${NC} untuk beralih akun."
+    echo -n "Beri alias/nama panggilan untuk akun ini (kosongkan jika tidak ada): "
+    read -r quick_alias
+    if [[ -n "$quick_alias" ]]; then
+        update_account_meta "$new_email" "alias" "$quick_alias"
+        echo -e "${GREEN}✓ Alias '${quick_alias}' disimpan.${NC}"
+    fi
+
+    echo ""
+    echo -e "Gunakan ${CYAN}gma switch <nomor|email|alias>${NC} atau ${CYAN}gma next${NC} untuk beralih akun."
     
+    send_termux_notification "🚀 GMA: Akun Baru Ditambahkan" "Akun $new_email siap digunakan." "default"
+
     trap - INT TERM
     rm -rf "$tmp_backup"
 }
@@ -466,7 +887,7 @@ add_account() {
 remove_account() {
     local target="${1:-}"
     if [[ -z "$target" ]]; then
-        echo -e "${RED}Error: Masukkan email atau nomor akun yang ingin dihapus.${NC}"
+        echo -e "${RED}Error: Masukkan email, nomor akun, atau alias yang ingin dihapus.${NC}"
         exit 1
     fi
     
@@ -480,9 +901,13 @@ remove_account() {
     
     local idx=1
     for acc in "${accounts[@]}"; do
-        local email="${acc%%|*}"
-        local dir="${acc#*|}"
-        if [[ "$target" == "$email" || "$target" == "$idx" ]]; then
+        local email
+        local dir
+        local alias
+        email=$(echo "$acc" | cut -d'|' -f1)
+        dir=$(echo "$acc" | cut -d'|' -f2)
+        alias=$(echo "$acc" | cut -d'|' -f3)
+        if [[ "$target" == "$email" || "$target" == "$idx" || ( -n "$alias" && "${target,,}" == "${alias,,}" ) ]]; then
             target_dir="$dir"
             target_email="$email"
             break
@@ -527,7 +952,16 @@ status_account() {
     if [[ "$current" == "none" ]]; then
         echo -e "Akun Aktif     : ${YELLOW}Tidak ada (Silakan login atau 'gma switch')${NC}"
     else
-        echo -e "Akun Aktif     : ${GREEN}${BOLD}$current${NC}"
+        local meta
+        meta=$(get_account_meta "$current")
+        local alias
+        local model
+        alias=$(echo "$meta" | cut -d'|' -f1)
+        model=$(echo "$meta" | cut -d'|' -f2)
+        local extra=""
+        [[ -n "$alias" ]] && extra+=" [Alias: $alias]"
+        [[ -n "$model" ]] && extra+=" [Model: $model]"
+        echo -e "Akun Aktif     : ${GREEN}${BOLD}$current${NC}${CYAN}$extra${NC}"
     fi
 
     if [[ -f "$TOKEN_FILE" ]]; then
@@ -575,8 +1009,17 @@ except Exception as e:
     echo -e "${BLUE}Daftar Akun Tersimpan (${#accounts[@]} Akun):${NC}"
     local idx=1
     for acc in "${accounts[@]}"; do
-        local email="${acc%%|*}"
-        local dir="${acc#*|}"
+        local email
+        local dir
+        local alias
+        local model
+        local auto_rot
+        email=$(echo "$acc" | cut -d'|' -f1)
+        dir=$(echo "$acc" | cut -d'|' -f2)
+        alias=$(echo "$acc" | cut -d'|' -f3)
+        model=$(echo "$acc" | cut -d'|' -f4)
+        auto_rot=$(echo "$acc" | cut -d'|' -f5)
+
         local mark="  "
         if [[ "$email" == "$current" ]]; then
             mark="${GREEN}* ${NC}"
@@ -585,7 +1028,13 @@ except Exception as e:
         if [[ -f "$dir/oauth-token" ]]; then
             has_tok="${GREEN}[Siap]${NC}"
         fi
-        echo -e "${mark}${BOLD}${idx}.${NC} ${email} ${has_tok}"
+
+        local details=""
+        [[ -n "$alias" ]] && details+=" ${MAGENTA}[$alias]${NC}"
+        [[ -n "$model" ]] && details+=" ${CYAN}($model)${NC}"
+        [[ "$auto_rot" == "false" ]] && details+=" ${YELLOW}[No-Rotate]${NC}"
+
+        echo -e "${mark}${BOLD}${idx}.${NC} ${email} ${has_tok}${details}"
         idx=$((idx + 1))
     done
 
@@ -622,7 +1071,7 @@ run_with_autoswitch() {
     local max_attempts=$(( total_accounts > 0 ? total_accounts : 1 ))
     local attempt=1
 
-    # Check if this invocation is interactive or print/batch
+    # Check if this invocation is batch/print mode
     local is_batch=0
     for arg in "$@"; do
         if [[ "$arg" == "-p" || "$arg" == "--print" || "$arg" == "--prompt" ]]; then
@@ -632,7 +1081,7 @@ run_with_autoswitch() {
     done
 
     if [[ $is_batch -eq 1 ]]; then
-        # Batch / non-interactive mode: auto-retry through accounts automatically
+        # Batch mode: auto-retry through accounts automatically
         while [[ $attempt -le $max_attempts ]]; do
             local current_email
             current_email=$(get_current_email)
@@ -642,7 +1091,6 @@ run_with_autoswitch() {
             mkdir -p "$(dirname "$tmp_out")"
             
             local exit_code=0
-            # Run and capture output while displaying in real time
             "$AGY_BIN" "$@" 2>&1 | tee "$tmp_out" || exit_code=$?
 
             # Inspect output for rate-limit / quota errors
@@ -652,12 +1100,14 @@ run_with_autoswitch() {
                 rm -f "$tmp_out"
                 if [[ $attempt -lt $max_attempts ]]; then
                     echo -e "${CYAN}[GMA] 🔄 Mengganti ke akun berikutnya secara otomatis...${NC}"
+                    send_termux_notification "⚠️ GMA: Limit Kuota" "Auto-switch dari $current_email ke akun selanjutnya..." "high"
                     next_account >/dev/null
                     attempt=$((attempt + 1))
                     echo ""
                     continue
                 else
                     echo -e "${RED}[GMA] ✗ Semua $total_accounts akun tersimpan telah dicoba atau mencapai limit!${NC}"
+                    send_termux_notification "🚨 GMA: Kuota Habis" "Seluruh akun telah mencapai limit kuota." "high"
                     return $exit_code
                 fi
             else
@@ -682,6 +1132,7 @@ run_with_autoswitch() {
         if grep -qiE "RESOURCE_EXHAUSTED|429|quota exceeded|rate limit|exhausted your quota" "$tmp_log"; then
             echo ""
             echo -e "${YELLOW}[GMA] ⚠️ Sesi terhenti karena batasan kuota / Rate Limit.${NC}"
+            send_termux_notification "⚠️ GMA: Sesi Limit" "Sesi agy terhenti karena limit kuota." "high"
             if [[ $total_accounts -gt 1 ]]; then
                 echo -e "${BLUE}Apakah Anda ingin beralih ke akun berikutnya dan melanjutkan percakapan (--continue)? [Y/n]${NC} "
                 read -r ans
@@ -720,6 +1171,7 @@ export_accounts() {
     size=$(du -h "$output_path" | cut -f1)
     echo -e "${GREEN}✓ Berhasil diekspor! Ukuran file: $size${NC}"
     echo -e "Simpan file backup ini di tempat yang aman."
+    send_termux_notification "📦 GMA: Backup Berhasil" "Arsip tersimpan di $output_path" "default"
 }
 
 # ------------------------------------------------------------------------------
@@ -747,6 +1199,7 @@ import_accounts() {
     count=$(get_saved_accounts | wc -l)
     echo -e "${GREEN}✓ Berhasil mengimpor! Total $count akun siap digunakan.${NC}"
     echo -e "Gunakan ${CYAN}gma list${NC} untuk melihat daftar akun yang diimpor."
+    send_termux_notification "📥 GMA: Restore Berhasil" "$count akun berhasil dipulihkan." "default"
 }
 
 # ------------------------------------------------------------------------------
@@ -766,7 +1219,13 @@ interactive_menu() {
         if [[ "$current" == "none" ]]; then
             cur_str="${YELLOW}Tidak ada${NC}"
         else
-            cur_str="${GREEN}${BOLD}$current${NC}"
+            local meta
+            meta=$(get_account_meta "$current")
+            local al
+            al=$(echo "$meta" | cut -d'|' -f1)
+            local extra=""
+            [[ -n "$al" ]] && extra=" ${MAGENTA}[$al]${NC}"
+            cur_str="${GREEN}${BOLD}$current${NC}${extra}"
         fi
 
         echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
@@ -778,17 +1237,19 @@ interactive_menu() {
         echo -e "  ${CYAN}1)${NC} 📋 Daftar Semua Akun Tersimpan (List)"
         echo -e "  ${CYAN}2)${NC} 🔄 Ganti Akun Aktif (Switch)"
         echo -e "  ${CYAN}3)${NC} ⏭️  Auto-Rotate ke Akun Berikutnya (Next)"
-        echo -e "  ${CYAN}4)${NC} ➕ Tambah Akun Baru (Add / Google Auth)"
-        echo -e "  ${CYAN}5)${NC} 💾 Simpan Akun Aktif Saat Ini (Save)"
-        echo -e "  ${CYAN}6)${NC} 📊 Cek Status & Token (Status / Quota)"
-        echo -e "  ${CYAN}7)${NC} ⚡ Jalankan AGY Mode Proteksi Kuota (gma run)"
-        echo -e "  ${CYAN}8)${NC} 🚀 Jalankan Antigravity CLI Interaktif"
-        echo -e "  ${CYAN}9)${NC} 📦 Backup / Export Akun (.tar.gz)"
-        echo -e " ${CYAN}10)${NC} 📥 Restore / Import Akun (.tar.gz)"
-        echo -e " ${CYAN}11)${NC} 🗑️  Hapus Akun Tersimpan (Remove)"
+        echo -e "  ${CYAN}4)${NC} ⚙️  Konfigurasi Kustom Akun (Alias, Model, Auto-Rotate)"
+        echo -e "  ${CYAN}5)${NC} ➕ Tambah Akun Baru (Add / Google Auth)"
+        echo -e "  ${CYAN}6)${NC} 💾 Simpan Akun Aktif Saat Ini (Save)"
+        echo -e "  ${CYAN}7)${NC} 📊 Cek Status & Token (Status / Quota)"
+        echo -e "  ${CYAN}8)${NC} ⚡ Jalankan AGY Mode Proteksi Kuota (gma run)"
+        echo -e "  ${CYAN}9)${NC} 🚀 Jalankan Antigravity CLI Interaktif"
+        echo -e " ${CYAN}10)${NC} 🔔 Uji Coba Notifikasi Termux"
+        echo -e " ${CYAN}11)${NC} 📦 Backup / Export Akun (.tar.gz)"
+        echo -e " ${CYAN}12)${NC} 📥 Restore / Import Akun (.tar.gz)"
+        echo -e " ${CYAN}13)${NC} 🗑️  Hapus Akun Tersimpan (Remove)"
         echo -e "  ${CYAN}0)${NC} 🚪 Keluar"
         echo -e "------------------------------------------------------------"
-        echo -n "Pilih menu [0-11]: "
+        echo -n "Pilih menu [0-13]: "
         read -r choice
 
         case "$choice" in
@@ -802,7 +1263,7 @@ interactive_menu() {
                 echo ""
                 list_accounts
                 echo ""
-                echo -n "Masukkan nomor urut atau email yang ingin diaktifkan: "
+                echo -n "Masukkan nomor urut, email, atau alias yang ingin diaktifkan: "
                 read -r target
                 if [[ -n "$target" ]]; then
                     switch_account "$target"
@@ -818,23 +1279,29 @@ interactive_menu() {
                 ;;
             4)
                 echo ""
-                add_account
+                config_account ""
                 echo ""
                 read -r -p "Tekan [Enter] untuk kembali..." _
                 ;;
             5)
                 echo ""
-                save_account
+                add_account
                 echo ""
                 read -r -p "Tekan [Enter] untuk kembali..." _
                 ;;
             6)
                 echo ""
-                status_account
+                save_account
                 echo ""
                 read -r -p "Tekan [Enter] untuk kembali..." _
                 ;;
             7)
+                echo ""
+                status_account
+                echo ""
+                read -r -p "Tekan [Enter] untuk kembali..." _
+                ;;
+            8)
                 echo ""
                 echo -n "Masukkan prompt atau argumen untuk agy (kosongkan untuk interaktif): "
                 read -r user_prompt
@@ -846,7 +1313,7 @@ interactive_menu() {
                 echo ""
                 read -r -p "Tekan [Enter] untuk kembali..." _
                 ;;
-            8)
+            9)
                 local agy_cmd
                 agy_cmd=$(get_agy_binary || true)
                 if [[ -n "$agy_cmd" ]]; then
@@ -857,7 +1324,13 @@ interactive_menu() {
                 echo ""
                 read -r -p "Tekan [Enter] untuk kembali..." _
                 ;;
-            9)
+            10)
+                echo ""
+                test_notification
+                echo ""
+                read -r -p "Tekan [Enter] untuk kembali..." _
+                ;;
+            11)
                 echo ""
                 echo -n "Path penyimpanan backup (kosongkan untuk default di ~/): "
                 read -r dest
@@ -865,7 +1338,7 @@ interactive_menu() {
                 echo ""
                 read -r -p "Tekan [Enter] untuk kembali..." _
                 ;;
-            10)
+            12)
                 echo ""
                 echo -n "Masukkan path file backup (.tar.gz): "
                 read -r src
@@ -873,11 +1346,11 @@ interactive_menu() {
                 echo ""
                 read -r -p "Tekan [Enter] untuk kembali..." _
                 ;;
-            11)
+            13)
                 echo ""
                 list_accounts
                 echo ""
-                echo -n "Masukkan nomor urut atau email yang ingin dihapus: "
+                echo -n "Masukkan nomor urut, email, atau alias yang ingin dihapus: "
                 read -r del_target
                 if [[ -n "$del_target" ]]; then
                     remove_account "$del_target"
@@ -902,20 +1375,22 @@ interactive_menu() {
 # ------------------------------------------------------------------------------
 show_help() {
     echo -e "${BLUE}=== 🚀 ${APP_NAME} v${VERSION} ===${NC}"
-    echo -e "Multi-Account Manager & Auto-Switcher untuk Google Antigravity CLI di Termux"
+    echo -e "Multi-Account Manager, Auto-Switcher & Enhancer untuk Google Antigravity CLI di Termux"
     echo ""
     echo -e "${BOLD}Penggunaan:${NC}"
     echo -e "  ${CYAN}gma${NC} [command] [options]"
     echo ""
     echo -e "${BOLD}Perintah Utama:${NC}"
     echo -e "  ${GREEN}menu${NC}                     Buka menu interaktif TUI (default jika tanpa argumen)"
-    echo -e "  ${GREEN}list${NC}, ${GREEN}ls${NC}                 Tampilkan semua akun tersimpan"
+    echo -e "  ${GREEN}list${NC}, ${GREEN}ls${NC}                 Tampilkan semua akun tersimpan beserta alias & model"
     echo -e "  ${GREEN}current${NC}, ${GREEN}whoami${NC}           Tampilkan akun yang sedang aktif"
-    echo -e "  ${GREEN}switch${NC} <nomor|email>     Ganti akun aktif berdasarkan nomor atau email"
-    echo -e "  ${GREEN}next${NC}, ${GREEN}rotate${NC}              Auto-rotate ke akun berikutnya (round-robin)"
+    echo -e "  ${GREEN}switch${NC} <id|alias|email>  Ganti akun aktif berdasarkan nomor, alias, atau email"
+    echo -e "  ${GREEN}next${NC}, ${GREEN}rotate${NC}              Auto-rotate ke akun berikutnya (hanya akun bertanda rotate)"
+    echo -e "  ${GREEN}config${NC}, ${GREEN}set${NC} <id|email>     Atur konfigurasi kustom (alias, default model, auto-rotate)"
+    echo -e "  ${GREEN}test-notif${NC}               Uji coba notifikasi status bar Termux"
     echo -e "  ${GREEN}add${NC}                      Tambah akun baru (via proses autentikasi Google)"
     echo -e "  ${GREEN}save${NC}                     Simpan akun aktif saat ini ke profil"
-    echo -e "  ${GREEN}remove${NC}, ${GREEN}rm${NC} <nomor|email>  Hapus akun tersimpan"
+    echo -e "  ${GREEN}remove${NC}, ${GREEN}rm${NC} <target>       Hapus akun tersimpan"
     echo -e "  ${GREEN}status${NC}, ${GREEN}quota${NC} [--ping]   Cek masa berlaku token, info akun, & ping API"
     echo -e "  ${GREEN}run${NC}, ${GREEN}exec${NC} <argumen...>     Jalankan agy dengan auto-switch jika limit kuota tercapai"
     echo -e "  ${GREEN}export${NC} [file.tar.gz]     Backup semua profil akun ke file terkompresi"
@@ -927,13 +1402,13 @@ show_help() {
     echo -e "  ${YELLOW}--no-color${NC}               Nonaktifkan warna ANSI"
     echo ""
     echo -e "${BOLD}Contoh:${NC}"
-    echo -e "  gma                      # Buka menu interaktif"
-    echo -e "  gma list                 # Lihat daftar semua akun"
-    echo -e "  gma switch 2             # Pindah ke akun nomor 2"
-    echo -e "  gma next                 # Pindah cepat ke akun selanjutnya"
-    echo -e "  gma status --ping        # Cek token & tes koneksi API"
-    echo -e "  gma run -p 'Halo agy'    # Eksekusi dengan proteksi auto-switch"
-    echo -e "  gma export ~/backup.tgz  # Backup akun"
+    echo -e "  gma                                  # Buka menu interaktif"
+    echo -e "  gma config 1 --alias Kerja           # Beri label alias pada akun #1"
+    echo -e "  gma config 1 --model 'Gemini 3.1 Pro (High)' # Atur default model"
+    echo -e "  gma switch Kerja                     # Beralih akun langsung via alias"
+    echo -e "  gma next                             # Rotasi akun berikutnya"
+    echo -e "  gma test-notif                       # Tes notifikasi Termux"
+    echo -e "  gma run -p 'Halo agy'                # Eksekusi dengan auto-switch"
 }
 
 # ------------------------------------------------------------------------------
@@ -948,6 +1423,8 @@ case "$cmd" in
     current|whoami) current_account ;;
     switch) switch_account "${1:-}" ;;
     next|rotate|auto-switch) next_account ;;
+    config|set) config_account "${1:-}" "$@" ;;
+    test-notif|notif) test_notification ;;
     add) add_account ;;
     save) save_account ;;
     remove|rm|delete) remove_account "${1:-}" ;;
