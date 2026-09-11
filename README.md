@@ -1,22 +1,44 @@
-# 🚀 GMA (Good Mode AGY) v1.2.0
+# 🚀 GMA (Good Mode AGY) v1.3.0
 
-**GMA (Good Mode AGY)** adalah toolkit serbaguna dan manajer akun cerdas untuk meningkatkan pengalaman menggunakan [Google Antigravity CLI (`agy`)](https://antigravity.google) di Android (Termux).
+**GMA (Good Mode AGY)** adalah toolkit serbaguna, manajer multi-akun cerdas, dan **True Auto-Switcher** untuk [Google Antigravity CLI (`agy`)](https://antigravity.google) di Android (Termux).
 
-GMA menghadirkan fitur **Multi-Akun**, **Konfigurasi Kustom per Akun**, **Notifikasi Termux**, **Auto-Switch saat Kuota Habis**, **Pemeriksaan Status Token**, **Menu Interaktif TUI**, serta **Backup & Restore**.
+GMA menghadirkan fitur **True Auto-Switching Tanpa Perintah (Zero-Command Auto-Switch)**, **Multi-Akun**, **Konfigurasi Kustom per Akun**, **Notifikasi Status Bar Termux**, **Background Daemon**, **Native Lifecycle Hooks**, **Inspeksi Token**, serta **Menu Interaktif TUI**.
+
+---
+
+## ⚡ True Auto-Switch Tanpa Perintah (Zero-Command)
+
+Salah satu kendala utama saat bekerja dengan Google Antigravity CLI adalah limit kuota mingguan/harian (`RESOURCE_EXHAUSTED (code 429): Individual quota reached`). Secara default, `agy` akan mencoba retry berulang kali hingga 20 menit secara sia-sia lalu berhenti, memaksa Anda keluar dan berganti akun secara manual.
+
+**GMA v1.3.0 menyelesaikan masalah ini secara tuntas:**
+
+1. 🔄 **Cukup Ketik `agy` Seperti Biasa (Transparent Wrapper)**  
+   Setelah instalasi, GMA memasang wrapper transparan di `~/bin/agy`. Anda tidak perlu menghafal atau mengetik perintah khusus seperti `gma run`. Cukup jalankan `agy` atau `agy -p "..."` seperti biasa.
+   
+2. ⏱️ **Deteksi Limit Real-Time (1.5 Detik)**  
+   Pemantau log aktif mendeteksi `RESOURCE_EXHAUSTED` dalam hitungan detik, langsung memutus loop retry 20 menit Google yang tidak ada gunanya.
+
+3. 🤖 **Otomatis Beralih & Melanjutkan Percakapan (Tanpa Konfirmasi / Tanpa Perintah)**  
+   GMA langsung merotasi kredensial ke akun berikutnya yang tersedia dan melanjutkan percakapan Anda (`agy --continue`) **tanpa memunculkan pertanyaan konfirmasi [Y/n]**. Sesi Anda berjalan mulus tanpa interupsi.
+
+4. 🛡️ **Background Daemon (`gma daemon`)**  
+   Daemon latar belakang yang dapat terus berjalan di Termux untuk memastikan peralihan akun tetap terjadi bahkan jika `agy` dipanggil dari sub-shell, skrip lain, atau tab berbeda.
+
+5. 🪝 **Antigravity Native Lifecycle Hooks**  
+   Terintegrasi langsung dengan mesin `hooks.json` bawaan Antigravity CLI (`~/.gemini/config/hooks.json`), menangani event `Stop` saat terjadi error kuota.
 
 ---
 
 ## ✨ Fitur Utama
 
-- 🔄 **Multi-Account Manager** — Simpan, ganti, dan kelola banyak akun Antigravity CLI tanpa perlu login ulang.
-- ⚙️ **Konfigurasi Kustom per Akun** — Beri alias/label (e.g. `Kerja`, `Utama`, `VIP`), tetapkan default model AI (e.g. `Gemini 3.8 Flash`, `Gemini 3.1 Pro`), serta atur apakah akun diikutkan dalam rotasi kuota (`gma config`).
-- 🔔 **Notifikasi Status Bar Termux** — Memberikan notifikasi pop-up dan getaran pada status bar Android saat terjadi auto-switch, batas kuota tercapai, atau proses selesai (`termux-notification`).
-- ⚡ **Auto-Switch / Rotasi Kuota** — Otomatis berpindah ke akun berikutnya (`gma next` / `gma run`) saat terkena rate limit atau batasan kuota Google.
-- 📊 **Inspeksi Status & Token** — Cek masa berlaku token, refresh token, integritas file, dan tes ping konektivitas API (`gma status`).
-- 📱 **Menu Interaktif TUI** — Tampilan menu terminal interaktif 13 pilihan yang mudah digunakan langsung di layar smartphone Termux (`gma`).
-- 📦 **Backup & Restore Profil** — Ekspor dan impor seluruh akun tersimpan dengan aman dalam format `.tar.gz` ber-permission ketat (`gma export` / `gma import`).
-- 🤖 **Didesain Khusus Termux** — Penanganan auth foreground dan path user-space yang stabil di Android.
-- 🔁 **Kompatibilitas Penuh** — Mendukung perintah baru `gma` maupun perintah lama `agy-account`.
+- ⚡ **True Auto-Switching** — Beralih akun otomatis seketika saat kuota habis tanpa perlu perintah manual atau konfirmasi.
+- 🔄 **Multi-Account Manager** — Simpan dan kelola banyak akun Google Antigravity CLI tanpa perlu login ulang.
+- ⚙️ **Konfigurasi Kustom per Akun** — Beri alias/label (e.g. `Utama`, `Kerja`, `VIP`), tetapkan default model AI (e.g. `Gemini 3.8 Flash (High)`), serta atur akun mana saja yang diikutkan dalam rotasi (`gma config`).
+- 🔔 **Notifikasi Status Bar Android** — Pop-up notifikasi dan getaran status bar Android saat akun otomatis berganti via `termux-notification`.
+- 🛡️ **Daemon & Live Watcher** — Background service (`gma daemon`) dan real-time console watcher (`gma watch`).
+- 📊 **Inspeksi Status & Token** — Cek masa berlaku token, refresh token, integritas file, dan tes ping API (`gma status`).
+- 📱 **Menu Interaktif TUI** — Tampilan menu terminal interaktif 16 pilihan yang ramah layar smartphone (`gma`).
+- 📦 **Backup & Restore Profil** — Ekspor dan impor seluruh akun tersimpan dalam format `.tar.gz` (`gma export` / `gma import`).
 
 ---
 
@@ -32,27 +54,41 @@ cd ~/good-mode-agy
 bash scripts/install.sh
 ```
 
-Installer ini akan:
-- Memasang binary `gma` dan `agy-account` ke `~/bin/`
-- Mendaftarkan path ke `~/.bashrc`
-- Memasang ke direktori bin internal AGY CLI agar langsung aktif
+Installer otomatis ini akan:
+- Memasang binary `gma`, `agy-account`, dan wrapper `agy` ke `~/bin/`
+- Mengonfigurasi PATH dan auto-start daemon di `~/.bashrc`
+- Mendaftarkan Antigravity Lifecycle Hook di `~/.gemini/config/hooks.json`
+- Menyalakan daemon pemantau kuota di latar belakang
 
 ---
 
 ## 🛠️ Penggunaan
 
-### 1. Menu Interaktif (Direkomendasikan di Termux)
-Cukup jalankan:
+### 1. Penggunaan Sehari-hari (Otomatis Penuh)
+
+Cukup gunakan perintah `agy` seperti biasa:
+```bash
+# Sesi interaktif biasa (otomatis auto-switch jika limit kuota):
+agy
+
+# Perintah prompt langsung (otomatis retry dengan akun lain jika limit):
+agy -p "Buatkan skrip backup database"
+```
+
+### 2. Menu Interaktif TUI
+Ketik:
 ```bash
 gma
 ```
-Akan muncul antarmuka menu:
+Antarmuka menu terminal akan terbuka:
 ```text
 ╔════════════════════════════════════════════════════════════╗
-║            🚀 GMA (Good Mode AGY) v1.2.0                  ║
+║            🚀 GMA (Good Mode AGY) v1.3.0                  ║
 ║      Multi-Account Manager & Auto-Switcher for Termux      ║
 ╚════════════════════════════════════════════════════════════╝
- Akun Aktif: user@gmail.com [Utama] | Tersimpan: 9 akun
+ Akun Aktif   : user@gmail.com [Utama] | Tersimpan: 10 akun
+ Auto-Switch  : Aktif Penuh (Otomatis Tanpa Perintah)
+ Daemon Watch : Aktif (PID: 25412) | Wrapper: Aktif di ~/bin/agy
 ------------------------------------------------------------
   1) 📋 Daftar Semua Akun Tersimpan (List)
   2) 🔄 Ganti Akun Aktif (Switch)
@@ -61,40 +97,42 @@ Akan muncul antarmuka menu:
   5) ➕ Tambah Akun Baru (Add / Google Auth)
   6) 💾 Simpan Akun Aktif Saat Ini (Save)
   7) 📊 Cek Status & Token (Status / Quota)
-  8) ⚡ Jalankan AGY Mode Proteksi Kuota (gma run)
-  9) 🚀 Jalankan Antigravity CLI Interaktif
- 10) 🔔 Uji Coba Notifikasi Termux
- 11) 📦 Backup / Export Akun (.tar.gz)
- 12) 📥 Restore / Import Akun (.tar.gz)
- 13) 🗑️  Hapus Akun Tersimpan (Remove)
+  8) ⚡ Jalankan AGY Mode Auto-Switch Kuota (gma run)
+  9) 🛡️ Kelola Auto-Switch Background Daemon
+ 10) ⚡ Pasang / Cek Transparent Wrapper 'agy'
+ 11) 👁️ Live Quota Watcher (Monitor Real-Time)
+ 12) 🔔 Uji Coba Notifikasi Termux
+ 13) 📦 Backup / Export Akun (.tar.gz)
+ 14) 📥 Restore / Import Akun (.tar.gz)
+ 15) 🗑️  Hapus Akun Tersimpan (Remove)
   0) 🚪 Keluar
 ------------------------------------------------------------
 ```
 
-### 2. Perintah CLI
-
-```bash
-gma <command> [options]
-# atau
-agy-account <command> [options]
-```
+### 3. Tabel Perintah CLI
 
 | Perintah | Deskripsi |
 |---|---|
+| `agy <args...>` | Jalankan Antigravity dengan auto-switch otomatis tanpa perintah |
 | `gma` / `gma menu` | Membuka menu interaktif TUI |
+| `gma run <args...>` | Eksekutor internal dengan proteksi auto-switch kuota |
+| `gma daemon start\|stop\|status` | Kelola daemon pemantau kuota di latar belakang |
+| `gma watch` | Pantau log kuota Antigravity secara real-time di layar |
+| `gma wrapper install\|uninstall` | Pasang/copot transparent wrapper `~/bin/agy` |
 | `gma list` / `ls` | Tampilkan daftar semua akun tersimpan beserta alias & model |
 | `gma current` / `whoami` | Tampilkan akun yang sedang aktif saat ini |
 | `gma switch <id\|alias\|email>` | Beralih ke akun tertentu via index, alias, atau email |
-| `gma next` / `rotate` | Auto-rotate ke akun berikutnya secara round-robin |
-| `gma config` `<id\|email>` | Atur alias, default model, status rotasi, atau catatan |
-| `gma test-notif` | Uji coba notifikasi Android status bar via Termux |
-| `gma add` | Tambah akun baru (menjalankan login Google di foreground) |
-| `gma save` | Simpan sesi akun aktif saat ini ke direktori profil |
+| `gma next` / `rotate` | Auto-rotate ke akun berikutnya secara manual |
+| `gma config <id\|email>` | Atur alias, default model, status rotasi, atau catatan |
+| `gma add` | Tambah akun baru via otentikasi Google |
+| `gma save` | Simpan sesi akun aktif saat ini ke profil GMA |
 | `gma remove <target>` | Hapus profil akun tersimpan |
-| `gma status` [`--ping`] | Cek validitas token aktif dan ping kesiapan model API |
-| `gma run <args...>` | Jalankan AGY dengan proteksi auto-switch bila kuota habis |
-| `gma export` [`file.tgz`] | Backup seluruh profil akun ke arsip `.tar.gz` |
-| `gma import` `<file.tgz>` | Pulihkan profil akun dari file backup `.tar.gz` |
+| `gma status` [`--ping`] | Cek validitas token, status daemon, wrapper, & ping API |
+| `gma test-notif` | Uji coba notifikasi Android status bar via Termux |
+| `gma setup-hooks` | Pasang native lifecycle hook ke `~/.gemini/config/hooks.json` |
+| `gma export [file.tgz]` | Backup seluruh profil akun ke arsip `.tar.gz` |
+| `gma import <file.tgz>` | Pulihkan profil akun dari file backup `.tar.gz` |
+| `gma raw <args...>` | Jalankan binary `agy` asli langsung tanpa intervensi GMA |
 | `gma version` / `-v` | Tampilkan versi GMA |
 | `gma help` / `-h` | Tampilkan bantuan lengkap |
 
@@ -102,47 +140,31 @@ agy-account <command> [options]
 
 ## 💡 Contoh Penggunaan Populer
 
-### Memberikan Label Alias & Model Kustom pada Akun
+### Menyetel Alias dan Model AI pada Akun
 ```bash
-# Set alias "Kerja" dan model Gemini 3.1 Pro pada akun nomor 1:
-gma config 1 --alias Kerja --model "Gemini 3.1 Pro (High)"
+# Beri alias "Utama" dan set model Gemini 3.8 Flash pada akun 1:
+gma config 1 --alias Utama --model "Gemini 3.8 Flash (High)"
 
-# Beralih akun cukup dengan memanggil namanya:
-gma switch Kerja
-# -> GMA akan otomatis beralih akun dan menyetel model ke Gemini 3.1 Pro!
+# Beralih langsung dengan memanggil alias:
+gma switch Utama
 ```
 
-### Proteksi Akun Penting dari Auto-Rotate
+### Melindungi Akun Penting dari Rotasi Otomatis
 ```bash
-# Matikan rotasi otomatis pada akun nomor 2 agar tidak dipakai rotasi kuota:
+# Nonaktifkan rotasi pada akun 2 agar tidak digunakan sebagai akun cadangan:
 gma config 2 --rotate off
+```
+
+### Memeriksa Status Daemon & Token
+```bash
+gma status
+gma daemon status
 ```
 
 ### Mengaktifkan Notifikasi Android Termux
 ```bash
-# Pasang paket Termux API jika belum ada:
 pkg install termux-api
-
-# Tes notifikasi:
 gma test-notif
-```
-
-### Auto-Rotate saat Kuota Habis
-```bash
-# Beralih cepat ke akun berikutnya:
-gma next
-
-# Atau jalankan prompt batch dengan auto-retry otomatis jika akun terkena limit:
-gma run -p "Buatkan ringkasan kode ini"
-```
-
-### Backup & Restore Akun
-```bash
-# Backup ke home:
-gma export ~/backup-akun-gma.tar.gz
-
-# Restore di perangkat lain:
-gma import ~/backup-akun-gma.tar.gz
 ```
 
 ---
@@ -152,12 +174,13 @@ gma import ~/backup-akun-gma.tar.gz
 ```text
 good-mode-agy/
 ├── bin/
-│   ├── gma               # Binary utama Good Mode AGY
+│   ├── agy               # Transparent wrapper dengan proteksi auto-switch
+│   ├── gma               # Binary utama Good Mode AGY v1.3.0
 │   └── agy-account       # Wrapper backward-compatibility
 ├── docs/
 │   └── multi-account.md  # Panduan lengkap multi-akun & konfigurasi GMA
 ├── scripts/
-│   └── install.sh        # Installer otomatis
+│   └── install.sh        # Installer otomatis lengkap
 ├── .gitignore
 ├── LICENSE
 └── README.md

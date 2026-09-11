@@ -1,12 +1,13 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ==============================================================================
-# 🚀 GMA (Good Mode AGY) - v1.2.0
-# Multi-Account Manager, Auto-Switcher & Enhancer for Antigravity CLI on Termux
+# 🚀 GMA (Good Mode AGY) - v1.3.0
+# Multi-Account Manager, True Auto-Switcher & Enhancer for Antigravity CLI on Termux
 # ==============================================================================
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 APP_NAME="GMA (Good Mode AGY)"
+GMA_BIN="$(readlink -f "${BASH_SOURCE[0]}")"
 
 # ANSI Colors
 if [[ "${1:-}" != "--no-color" && -t 1 ]]; then
@@ -39,6 +40,11 @@ HOME_DIR="${HOME:-/data/data/com.termux/files/home}"
 GEMINI_DIR="$HOME_DIR/.gemini"
 AGY_CLI_DIR="$GEMINI_DIR/antigravity-cli"
 ACCOUNTS_DIR="$GEMINI_DIR/accounts"
+CONFIG_DIR="$GEMINI_DIR/config"
+HOOKS_FILE="$CONFIG_DIR/hooks.json"
+TMP_DIR="$GEMINI_DIR/tmp"
+DAEMON_PID_FILE="$TMP_DIR/gma_daemon.pid"
+DAEMON_LOG_FILE="$TMP_DIR/gma_daemon.log"
 
 # Target files
 TOKEN_FILE="$AGY_CLI_DIR/antigravity-oauth-token"
@@ -46,7 +52,7 @@ CRED_FILE="$GEMINI_DIR/gemini-credentials.json"
 GOOGLE_ACC_FILE="$GEMINI_DIR/google_accounts.json"
 SETTINGS_FILE="$AGY_CLI_DIR/settings.json"
 
-mkdir -p "$ACCOUNTS_DIR"
+mkdir -p "$ACCOUNTS_DIR" "$TMP_DIR" "$CONFIG_DIR"
 
 # ------------------------------------------------------------------------------
 # Helper: Termux & Terminal Notifications
@@ -56,43 +62,67 @@ send_termux_notification() {
     local content="$2"
     local priority="${3:-high}"
 
-    # 1. Termux API notification if installed
-    if command -v termux-notification &>/dev/null; then
-        termux-notification \
-            --title "$title" \
-            --content "$content" \
-            --id "gma_notify" \
-            --priority "$priority" \
-            --icon "sync" 2>/dev/null || true
-    fi
+    # Non-blocking async background execution for Termux API calls
+    (
+        if command -v termux-notification &>/dev/null; then
+            timeout 1 termux-notification \
+                --title "$title" \
+                --content "$content" \
+                --id "gma_notify" \
+                --priority "$priority" \
+                --icon "sync" 2>/dev/null || true
+        fi
 
-    # 2. Termux Toast if installed
-    if command -v termux-toast &>/dev/null; then
-        termux-toast "$title: $content" 2>/dev/null || true
-    fi
+        if command -v termux-toast &>/dev/null; then
+            timeout 1 termux-toast "$title: $content" 2>/dev/null || true
+        fi
+    ) >/dev/null 2>&1 &
 
-    # 3. Terminal Notification Escape sequences (OSC 9 & OSC 777) & Bell
+    # Terminal Notification Escape sequences (OSC 9 & OSC 777) & Bell
     printf '\e]9;%s: %s\a' "$title" "$content" 2>/dev/null || true
     printf '\a' 2>/dev/null || true
 }
 
 # ------------------------------------------------------------------------------
-# Helper: Locate working agy binary
+# Helper: Locate real working agy binary (Strictly avoiding self-recursion)
 # ------------------------------------------------------------------------------
 get_agy_binary() {
-    local candidates=()
-    local sys_agy
-    sys_agy=$(command -v agy 2>/dev/null || true)
-    [[ -n "$sys_agy" ]] && candidates+=("$sys_agy")
-    [[ -n "${PREFIX:-}" && -x "$PREFIX/bin/agy" ]] && candidates+=("$PREFIX/bin/agy")
-    candidates+=(
+    local candidates=(
         "/data/data/com.termux/files/usr/bin/agy"
-        "$HOME/.local/bin/agy"
+        "${PREFIX:-/data/data/com.termux/files/usr}/bin/agy"
+        "/usr/bin/agy"
+        "$HOME_DIR/.local/bin/agy"
     )
+
+    # Search PATH but strictly ignore GMA wrapper or ~/bin/agy
+    local p_agy
+    while IFS= read -r p_agy; do
+        [[ -z "$p_agy" ]] && continue
+        candidates+=("$p_agy")
+    done < <(which -a agy 2>/dev/null || type -a -p agy 2>/dev/null || true)
+
+    local my_real
+    my_real=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "")
 
     for candidate in "${candidates[@]}"; do
         if [[ -x "$candidate" ]]; then
-            if "$candidate" --help >/dev/null 2>&1; then
+            local cand_real
+            cand_real=$(readlink -f "$candidate" 2>/dev/null || echo "")
+            # Never return GMA binary or agy wrapper
+            if [[ -n "$my_real" && "$cand_real" == "$my_real" ]]; then
+                continue
+            fi
+            if [[ "$candidate" == "$HOME_DIR/bin/agy" || "$cand_real" == "$HOME_DIR/bin/agy" ]]; then
+                continue
+            fi
+            if [[ "$candidate" == "$HOME_DIR/bin/gma" || "$cand_real" == "$HOME_DIR/bin/gma" ]]; then
+                continue
+            fi
+            # Skip any wrapper script that contains GMA_BIN or calls gma
+            if head -n 10 "$candidate" 2>/dev/null | grep -qE "GMA_BIN|gma run|Good Mode AGY"; then
+                continue
+            fi
+            if "$candidate" --version >/dev/null 2>&1 || "$candidate" --help >/dev/null 2>&1; then
                 echo "$candidate"
                 return 0
             fi
@@ -779,7 +809,7 @@ test_notification() {
         echo ""
     fi
 
-    send_termux_notification "🚀 GMA (Good Mode AGY)" "Uji coba notifikasi Termux berhasil! Sistem GMA siap beroperasi." "high"
+    send_termux_notification "🚀 GMA (Good Mode AGY)" "Uji coba notifikasi Termux berhasil! Sistem Auto-Switch GMA siap beroperasi." "high"
     echo -e "${GREEN}✓ Sinyal notifikasi telah dikirimkan!${NC}"
 }
 
@@ -806,7 +836,7 @@ add_account() {
         echo -e "${GREEN}✓ Akun saat ini aman dibackup.${NC}"
     fi
 
-    local tmp_backup="$GEMINI_DIR/tmp/agy_auth_$$"
+    local tmp_backup="$TMP_DIR/agy_auth_$$"
     mkdir -p "$tmp_backup"
 
     # Temporarily move active credentials
@@ -964,6 +994,28 @@ status_account() {
         echo -e "Akun Aktif     : ${GREEN}${BOLD}$current${NC}${CYAN}$extra${NC}"
     fi
 
+    # Check Daemon status
+    local daemon_running=0
+    if [[ -f "$DAEMON_PID_FILE" ]]; then
+        local dpid
+        dpid=$(cat "$DAEMON_PID_FILE" 2>/dev/null || echo "")
+        if [[ -n "$dpid" ]] && kill -0 "$dpid" 2>/dev/null; then
+            daemon_running=1
+        fi
+    fi
+    if [[ $daemon_running -eq 1 ]]; then
+        echo -e "Daemon Watcher : ${GREEN}Aktif di Latar Belakang (PID: $(cat "$DAEMON_PID_FILE"))${NC}"
+    else
+        echo -e "Daemon Watcher : ${YELLOW}Nonaktif ('gma daemon start' untuk mengaktifkan)${NC}"
+    fi
+
+    # Check Wrapper status
+    if [[ -x "$HOME_DIR/bin/agy" ]]; then
+        echo -e "Wrapper agy    : ${GREEN}Terpasang di ~/bin/agy (Auto-Switch Siap)${NC}"
+    else
+        echo -e "Wrapper agy    : ${YELLOW}Belum Terpasang ('gma wrapper install' untuk memasang)${NC}"
+    fi
+
     if [[ -f "$TOKEN_FILE" ]]; then
         echo -e "File Token     : ${GREEN}Tersedia${NC} (${TOKEN_FILE})"
         if command -v python3 &>/dev/null; then
@@ -1053,14 +1105,29 @@ except Exception as e:
 }
 
 # ------------------------------------------------------------------------------
-# Command: run (Execute agy with Auto-Switch on Rate Limit / Quota Exceeded)
+# Command: run (Execute agy with 100% Automatic Auto-Switch on Quota Exceeded)
 # ------------------------------------------------------------------------------
 run_with_autoswitch() {
     local AGY_BIN
     if ! AGY_BIN=$(get_agy_binary); then
-        echo -e "${RED}Error: Binary 'agy' tidak ditemukan.${NC}"
+        echo -e "${RED}Error: Binary 'agy' asli tidak ditemukan di sistem.${NC}"
         exit 1
     fi
+
+    # Support --raw flag to bypass auto-switch
+    if [[ "${1:-}" == "--raw" ]]; then
+        shift
+        exec "$AGY_BIN" "$@"
+    fi
+
+    # Pass-through informational commands directly without wrapper intervention
+    for arg in "$@"; do
+        case "$arg" in
+            --version|-v|version|--help|-h|help|models|agents|changelog)
+                exec "$AGY_BIN" "$@"
+                ;;
+        esac
+    done
 
     local accounts=()
     while IFS= read -r line; do
@@ -1069,7 +1136,12 @@ run_with_autoswitch() {
 
     local total_accounts=${#accounts[@]}
     local max_attempts=$(( total_accounts > 0 ? total_accounts : 1 ))
-    local attempt=1
+    local attempt=${GMA_SWITCH_ATTEMPT:-1}
+
+    # If single account or no accounts, run agy directly
+    if [[ $total_accounts -le 1 ]]; then
+        exec "$AGY_BIN" "$@"
+    fi
 
     # Check if this invocation is batch/print mode
     local is_batch=0
@@ -1080,72 +1152,520 @@ run_with_autoswitch() {
         fi
     done
 
+    local cli_log="$AGY_CLI_DIR/cli.log"
+
     if [[ $is_batch -eq 1 ]]; then
-        # Batch mode: auto-retry through accounts automatically
+        # ----------------------------------------------------------------------
+        # Batch Mode: Auto-switch & retry through accounts automatically
+        # ----------------------------------------------------------------------
         while [[ $attempt -le $max_attempts ]]; do
             local current_email
             current_email=$(get_current_email)
-            echo -e "${BLUE}[GMA] Menjalankan perintah dengan akun: ${GREEN}$current_email${NC} (Percobaan $attempt/$max_attempts)..."
+            echo -e "${BLUE}[GMA Auto-Switch] Menjalankan perintah dengan akun: ${GREEN}$current_email${NC} (Percobaan $attempt/$max_attempts)..."
             
-            local tmp_out="$GEMINI_DIR/tmp/gma_run_$$.log"
+            local tmp_out="$TMP_DIR/gma_run_$$.log"
             mkdir -p "$(dirname "$tmp_out")"
             
             local exit_code=0
             "$AGY_BIN" "$@" 2>&1 | tee "$tmp_out" || exit_code=$?
 
             # Inspect output for rate-limit / quota errors
-            if [[ $exit_code -ne 0 ]] || grep -qiE "RESOURCE_EXHAUSTED|429|quota exceeded|quota_exceeded|rate limit|rate_limit|rate-limit|exhausted your quota|capacity" "$tmp_out"; then
+            if [[ $exit_code -ne 0 ]] || grep -qiE "RESOURCE_EXHAUSTED|429|quota exceeded|quota_exceeded|rate limit|rate_limit|rate-limit|exhausted your quota|Individual quota reached" "$tmp_out"; then
                 echo ""
-                echo -e "${YELLOW}[GMA] ⚠️ Kuota habis atau Rate Limit terdeteksi pada akun: ${RED}$current_email${NC}"
+                echo -e "${YELLOW}[GMA Auto-Switch] ⚠️ Kuota habis / Rate Limit terdeteksi pada: ${RED}$current_email${NC}"
                 rm -f "$tmp_out"
                 if [[ $attempt -lt $max_attempts ]]; then
-                    echo -e "${CYAN}[GMA] 🔄 Mengganti ke akun berikutnya secara otomatis...${NC}"
+                    echo -e "${CYAN}[GMA Auto-Switch] 🔄 Beralih ke akun berikutnya secara otomatis (tanpa perintah)...${NC}"
                     send_termux_notification "⚠️ GMA: Limit Kuota" "Auto-switch dari $current_email ke akun selanjutnya..." "high"
                     next_account >/dev/null
+                    local next_email
+                    next_email=$(get_current_email)
+                    send_termux_notification "🔄 GMA: Akun Berganti" "Sekarang menggunakan: $next_email" "high"
                     attempt=$((attempt + 1))
                     echo ""
                     continue
                 else
-                    echo -e "${RED}[GMA] ✗ Semua $total_accounts akun tersimpan telah dicoba atau mencapai limit!${NC}"
-                    send_termux_notification "🚨 GMA: Kuota Habis" "Seluruh akun telah mencapai limit kuota." "high"
+                    echo -e "${RED}[GMA Auto-Switch] ✗ Seluruh $total_accounts akun tersimpan telah dicoba atau mencapai limit kuota!${NC}"
+                    send_termux_notification "🚨 GMA: Semua Kuota Habis" "Seluruh akun telah mencapai limit kuota Google." "high"
+                    unset GMA_SWITCH_ATTEMPT
                     return $exit_code
                 fi
             else
                 rm -f "$tmp_out"
+                unset GMA_SWITCH_ATTEMPT
                 return $exit_code
             fi
         done
     else
-        # Interactive mode: launch directly
+        # ----------------------------------------------------------------------
+        # Interactive Mode: Connected to TTY with background quota watcher
+        # ----------------------------------------------------------------------
         local current_email
         current_email=$(get_current_email)
-        echo -e "${BLUE}=== 🚀 ${APP_NAME} - Running Antigravity ===${NC}"
-        echo -e "Akun Aktif: ${GREEN}${BOLD}$current_email${NC}"
+        echo -e "${BLUE}=== 🚀 ${APP_NAME} v${VERSION} - Mode Auto-Switch Aktif ===${NC}"
+        echo -e "Akun Aktif : ${GREEN}${BOLD}$current_email${NC}"
+        echo -e "Proteksi   : ${CYAN}Auto-Switch Kuota Otomatis (Tanpa Perintah)${NC}"
         echo ""
 
-        local tmp_log="$GEMINI_DIR/tmp/gma_interactive_$$.log"
-        mkdir -p "$(dirname "$tmp_log")"
-        local exit_code=0
+        local start_size=0
+        if [[ -f "$cli_log" ]]; then
+            start_size=$(wc -c < "$cli_log" 2>/dev/null || echo 0)
+        fi
 
-        "$AGY_BIN" "$@" 2>&1 | tee "$tmp_log" || exit_code=$?
+        local quota_flag="$TMP_DIR/gma_quota_flag_$$"
+        mkdir -p "$(dirname "$quota_flag")"
+        rm -f "$quota_flag"
 
-        if grep -qiE "RESOURCE_EXHAUSTED|429|quota exceeded|rate limit|exhausted your quota" "$tmp_log"; then
-            echo ""
-            echo -e "${YELLOW}[GMA] ⚠️ Sesi terhenti karena batasan kuota / Rate Limit.${NC}"
-            send_termux_notification "⚠️ GMA: Sesi Limit" "Sesi agy terhenti karena limit kuota." "high"
-            if [[ $total_accounts -gt 1 ]]; then
-                echo -e "${BLUE}Apakah Anda ingin beralih ke akun berikutnya dan melanjutkan percakapan (--continue)? [Y/n]${NC} "
-                read -r ans
-                if [[ "$ans" =~ ^[Yy]$ || -z "$ans" ]]; then
-                    next_account
-                    rm -f "$tmp_log"
-                    exec "$0" run --continue
+        # Background log monitor: detects quota errors in real time
+        # This breaks agy out of the futile 20-minute retry loop within 1.5s
+        local watcher_pid=""
+        (
+            local last_s=$start_size
+            while true; do
+                sleep 1.2
+                if [[ ! -f "$cli_log" ]]; then
+                    continue
+                fi
+                local cur_s
+                cur_s=$(wc -c < "$cli_log" 2>/dev/null || echo 0)
+                if (( cur_s > last_s )); then
+                    local chunk
+                    chunk=$(tail -c +$((last_s + 1)) "$cli_log" 2>/dev/null || true)
+                    last_s=$cur_s
+                    if echo "$chunk" | grep -qiE "RESOURCE_EXHAUSTED|Individual quota reached|quota exceeded|code 429|exhausted your quota"; then
+                        touch "$quota_flag"
+                        # Terminate the agy process so it doesn't wait 20 minutes on retry backoff
+                        local agy_pids
+                        agy_pids=$(pgrep -P "$$" agy 2>/dev/null || true)
+                        if [[ -n "$agy_pids" ]]; then
+                            kill -TERM $agy_pids 2>/dev/null || true
+                        fi
+                        break
+                    fi
+                elif (( cur_s < last_s )); then
+                    last_s=0
+                fi
+            done
+        ) >/dev/null 2>&1 &
+        watcher_pid=$!
+
+        # Run agy with full terminal TTY attached
+        local agy_exit=0
+        "$AGY_BIN" "$@" || agy_exit=$?
+
+        # Cleanup watcher
+        kill "$watcher_pid" 2>/dev/null || true
+        wait "$watcher_pid" 2>/dev/null || true
+
+        # Check if quota limit was hit
+        local quota_hit=0
+        if [[ -f "$quota_flag" ]]; then
+            quota_hit=1
+            rm -f "$quota_flag"
+        elif [[ $agy_exit -ne 0 && -f "$cli_log" ]]; then
+            local final_size
+            final_size=$(wc -c < "$cli_log" 2>/dev/null || echo 0)
+            if (( final_size > start_size )); then
+                local diff_log
+                diff_log=$(tail -c +$((start_size + 1)) "$cli_log" 2>/dev/null || true)
+                if echo "$diff_log" | grep -qiE "RESOURCE_EXHAUSTED|Individual quota reached|quota exceeded|code 429|exhausted your quota"; then
+                    quota_hit=1
                 fi
             fi
         fi
-        rm -f "$tmp_log"
-        return $exit_code
+
+        if [[ $quota_hit -eq 1 ]]; then
+            echo ""
+            echo -e "${YELLOW}╔════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${YELLOW}║         ⚠️  BATASAN KUOTA / RATE LIMIT TERDETEKSI!         ║${NC}"
+            echo -e "${YELLOW}╚════════════════════════════════════════════════════════════╝${NC}"
+            echo -e "Akun yang mencapai batas kuota: ${RED}${BOLD}$current_email${NC}"
+
+            if [[ $attempt -ge $max_attempts ]]; then
+                echo -e "${RED}[GMA Auto-Switch] ✗ Seluruh $total_accounts akun tersimpan telah mencapai batas kuota Google.${NC}"
+                send_termux_notification "🚨 GMA: Semua Kuota Habis" "Seluruh akun tersimpan telah mencapai batas kuota Google." "high"
+                unset GMA_SWITCH_ATTEMPT
+                return 1
+            fi
+
+            echo -e "${CYAN}🔄 Mengalihkan akun aktif ke akun berikutnya secara otomatis (tanpa perintah)...${NC}"
+            next_account >/dev/null
+            local next_email
+            next_email=$(get_current_email)
+
+            send_termux_notification "🔄 GMA: Auto-Switch Akun" "Beralih ke: $next_email (Melanjutkan percakapan)" "high"
+            echo -e "${GREEN}✓ Sekarang beralih ke: ${BOLD}$next_email${NC}"
+            echo -e "${BLUE}▶ Melanjutkan percakapan secara otomatis (agy --continue)...${NC}"
+            echo ""
+            sleep 1
+
+            export GMA_SWITCH_ATTEMPT=$((attempt + 1))
+
+            # Determine continuation args: ensure --continue is present
+            local has_cont=0
+            for a in "$@"; do
+                if [[ "$a" == "-c" || "$a" == "--continue" ]]; then
+                    has_cont=1
+                    break
+                fi
+            done
+
+            if [[ $has_cont -eq 1 ]]; then
+                exec "$GMA_BIN" run "$@"
+            else
+                exec "$GMA_BIN" run --continue "$@"
+            fi
+        fi
+
+        unset GMA_SWITCH_ATTEMPT
+        return $agy_exit
     fi
+}
+
+# ------------------------------------------------------------------------------
+# Subcommand: daemon (Background Auto-Switch Monitor)
+# ------------------------------------------------------------------------------
+daemon_run() {
+    local cli_log="$AGY_CLI_DIR/cli.log"
+    mkdir -p "$TMP_DIR"
+    
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] GMA Daemon v${VERSION} started (PID: $$)" >> "$DAEMON_LOG_FILE"
+
+    local last_size=0
+    local last_switch_time=0
+    local current_inode=""
+
+    if [[ -f "$cli_log" ]]; then
+        last_size=$(wc -c < "$cli_log" 2>/dev/null || echo 0)
+        current_inode=$(stat -c %i "$cli_log" 2>/dev/null || echo "")
+    fi
+
+    while true; do
+        sleep 1.5
+
+        if [[ ! -e "$cli_log" ]]; then
+            continue
+        fi
+
+        # Detect log rotation (new inode or file shrank)
+        local cur_inode
+        cur_inode=$(stat -c %i "$cli_log" 2>/dev/null || echo "")
+        local cur_size
+        cur_size=$(wc -c < "$cli_log" 2>/dev/null || echo 0)
+
+        if [[ "$cur_inode" != "$current_inode" ]] || (( cur_size < last_size )); then
+            current_inode="$cur_inode"
+            last_size=0
+        fi
+
+        if (( cur_size > last_size )); then
+            local new_content
+            new_content=$(tail -c +$((last_size + 1)) "$cli_log" 2>/dev/null || true)
+            last_size=$cur_size
+
+            if echo "$new_content" | grep -qiE "RESOURCE_EXHAUSTED|Individual quota reached|quota exceeded|code 429|exhausted your quota"; then
+                local now_ts
+                now_ts=$(date +%s)
+                # Debounce: avoid duplicate switches within 6 seconds
+                if (( now_ts - last_switch_time > 6 )); then
+                    last_switch_time=$now_ts
+                    local prev_email
+                    prev_email=$(get_current_email)
+
+                    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [ALERT] Limit kuota terdeteksi pada $prev_email. Auto-switching..." >> "$DAEMON_LOG_FILE"
+
+                    next_account >/dev/null 2>&1 || true
+                    local new_email
+                    new_email=$(get_current_email)
+
+                    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [SWITCH] Berhasil beralih dari $prev_email ke $new_email" >> "$DAEMON_LOG_FILE"
+
+                    send_termux_notification "🔄 GMA Auto-Switch (Daemon)" "Kuota $prev_email habis. Otomatis beralih ke: $new_email" "high"
+
+                    # If agy process is currently running and stuck in retry loop, interrupt it so it can restart cleanly
+                    local agy_pids
+                    agy_pids=$(pgrep -f "agy.*--.*|agy$" 2>/dev/null || true)
+                    if [[ -n "$agy_pids" ]]; then
+                        for ap in $agy_pids; do
+                            if [[ "$ap" != "$$" ]]; then
+                                kill -TERM "$ap" 2>/dev/null || true
+                            fi
+                        done
+                    fi
+                fi
+            fi
+        fi
+    done
+}
+
+daemon_start() {
+    local quiet="${1:-}"
+    mkdir -p "$TMP_DIR"
+
+    if [[ -f "$DAEMON_PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$DAEMON_PID_FILE" 2>/dev/null || echo "")
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            [[ "$quiet" != "--quiet" ]] && echo -e "${YELLOW}GMA Daemon sudah berjalan (PID: ${pid}).${NC}"
+            return 0
+        fi
+    fi
+
+    if command -v setsid &>/dev/null; then
+        setsid bash "$GMA_BIN" daemon run </dev/null >/dev/null 2>&1 &
+    else
+        nohup bash "$GMA_BIN" daemon run </dev/null >/dev/null 2>&1 &
+    fi
+    local new_pid=$!
+    disown "$new_pid" 2>/dev/null || true
+    echo "$new_pid" > "$DAEMON_PID_FILE"
+
+    if [[ "$quiet" != "--quiet" ]]; then
+        echo -e "${GREEN}✓ GMA Auto-Switch Daemon berhasil dijalankan di latar belakang! (PID: ${new_pid})${NC}"
+        echo -e "Daemon akan terus memantau limit kuota secara otomatis tanpa perlu perintah manual."
+    fi
+}
+
+daemon_stop() {
+    if [[ -f "$DAEMON_PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$DAEMON_PID_FILE" 2>/dev/null || echo "")
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            sleep 0.5
+            kill -9 "$pid" 2>/dev/null || true
+            rm -f "$DAEMON_PID_FILE"
+            echo -e "${GREEN}✓ GMA Daemon (PID: ${pid}) berhasil dihentikan.${NC}"
+            return 0
+        fi
+        rm -f "$DAEMON_PID_FILE"
+    fi
+    echo -e "${YELLOW}GMA Daemon tidak sedang berjalan.${NC}"
+}
+
+daemon_status() {
+    echo -e "${BLUE}=== 🛡️ GMA Auto-Switch Daemon Status ===${NC}"
+
+    local running=0
+    local pid=""
+    if [[ -f "$DAEMON_PID_FILE" ]]; then
+        pid=$(cat "$DAEMON_PID_FILE" 2>/dev/null || echo "")
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            running=1
+        fi
+    fi
+
+    if [[ $running -eq 1 ]]; then
+        echo -e "Status         : ${GREEN}${BOLD}AKTIF (Berjalan di latar belakang)${NC}"
+        echo -e "PID            : ${CYAN}${pid}${NC}"
+        echo -e "Mode           : ${GREEN}Auto-Switch Penuh (Tanpa Perintah)${NC}"
+    else
+        echo -e "Status         : ${YELLOW}NONAKTIF (Tidak berjalan)${NC}"
+        echo -e "Jalankan       : ${CYAN}gma daemon start${NC} untuk mengaktifkan pemantau latar belakang."
+    fi
+
+    if [[ -f "$DAEMON_LOG_FILE" ]]; then
+        echo ""
+        echo -e "${BLUE}Log Aktivitas Terakhir (5 baris terakhir):${NC}"
+        tail -n 5 "$DAEMON_LOG_FILE" | sed 's/^/  /'
+    fi
+}
+
+daemon_log() {
+    if [[ -f "$DAEMON_LOG_FILE" ]]; then
+        tail -n "${1:-30}" "$DAEMON_LOG_FILE"
+    else
+        echo -e "${YELLOW}Belum ada log daemon.${NC}"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Subcommand: watch (Interactive Quota Log Watcher)
+# ------------------------------------------------------------------------------
+watch_log() {
+    echo -e "${BLUE}=== 👁️ GMA Live Quota Watcher ===${NC}"
+    echo -e "Memantau log Antigravity CLI secara real-time..."
+    echo -e "Tekan ${CYAN}Ctrl+C${NC} untuk keluar.\n"
+    
+    local cli_log="$AGY_CLI_DIR/cli.log"
+    if [[ ! -f "$cli_log" ]]; then
+        echo -e "${YELLOW}Menunggu log Antigravity dibuat di $cli_log...${NC}"
+        while [[ ! -f "$cli_log" ]]; do
+            sleep 1
+        done
+    fi
+    
+    local last_size
+    last_size=$(wc -c < "$cli_log" 2>/dev/null || echo 0)
+    
+    while true; do
+        sleep 1
+        local cur_size
+        cur_size=$(wc -c < "$cli_log" 2>/dev/null || echo 0)
+        if (( cur_size > last_size )); then
+            local new_content
+            new_content=$(tail -c +$((last_size + 1)) "$cli_log" 2>/dev/null || true)
+            last_size=$cur_size
+            
+            if echo "$new_content" | grep -qiE "RESOURCE_EXHAUSTED|Individual quota reached|quota exceeded|code 429|exhausted your quota"; then
+                local prev
+                prev=$(get_current_email)
+                echo -e "\n${RED}⚠️ [$(date +%H:%M:%S)] DETEKSI LIMIT KUOTA pada: $prev${NC}"
+                echo -e "${CYAN}🔄 Beralih ke akun berikutnya secara otomatis...${NC}"
+                next_account
+                local nxt
+                nxt=$(get_current_email)
+                echo -e "${GREEN}✓ Akun aktif sekarang: $nxt${NC}\n"
+            fi
+        elif (( cur_size < last_size )); then
+            last_size=0
+        fi
+    done
+}
+
+# ------------------------------------------------------------------------------
+# Subcommand: hook (Antigravity Lifecycle Hooks Integration)
+# ------------------------------------------------------------------------------
+hook_stop_handler() {
+    local payload
+    payload=$(cat) # reads stdin JSON
+
+    local is_quota=0
+    if echo "$payload" | grep -qiE "RESOURCE_EXHAUSTED|Individual quota reached|quota exceeded|code 429|exhausted your quota"; then
+        is_quota=1
+    fi
+
+    if [[ "$is_quota" -eq 1 ]]; then
+        local prev_acc
+        prev_acc=$(get_current_email)
+        next_account >/dev/null 2>&1 || true
+        local new_acc
+        new_acc=$(get_current_email)
+        send_termux_notification "🔄 GMA Auto-Switch (Hook)" "Kuota $prev_acc habis. Beralih ke $new_acc." "high"
+        echo "{\"decision\":\"continue\",\"reason\":\"[GMA Auto-Switch] Kuota limit terdeteksi pada $prev_acc. Akun telah otomatis dialihkan ke $new_acc. Melanjutkan percakapan...\"}"
+    else
+        echo "{}"
+    fi
+}
+
+setup_hooks() {
+    mkdir -p "$CONFIG_DIR"
+    local gma_path="$HOME_DIR/bin/gma"
+    if [[ ! -x "$gma_path" ]]; then
+        gma_path="$GMA_BIN"
+    fi
+
+    if command -v python3 &>/dev/null; then
+        python3 -c "
+import json, os
+
+hooks_file = '$HOOKS_FILE'
+gma_bin = '$gma_path'
+
+data = {}
+if os.path.exists(hooks_file):
+    try:
+        with open(hooks_file) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+
+data['gma-autoswitch'] = {
+    'enabled': True,
+    'Stop': [
+        {
+            'type': 'command',
+            'command': f'{gma_bin} hook stop',
+            'timeout': 15
+        }
+    ]
+}
+
+with open(hooks_file, 'w') as f:
+    json.dump(data, f, indent=2)
+"
+    else
+        cat << EOF > "$HOOKS_FILE"
+{
+  "gma-autoswitch": {
+    "enabled": true,
+    "Stop": [
+      {
+        "type": "command",
+        "command": "$gma_path hook stop",
+        "timeout": 15
+      }
+    ]
+  }
+}
+EOF
+    fi
+    echo -e "${GREEN}✓ Antigravity Lifecycle Hook berhasil dipasang di $HOOKS_FILE${NC}"
+}
+
+# ------------------------------------------------------------------------------
+# Subcommand: wrapper (Manage Transparent 'agy' Wrapper)
+# ------------------------------------------------------------------------------
+manage_wrapper() {
+    local action="${1:-status}"
+    local wrapper_target="$HOME_DIR/bin/agy"
+
+    case "$action" in
+        install)
+            mkdir -p "$HOME_DIR/bin"
+            cat << 'EOF' > "$wrapper_target"
+#!/data/data/com.termux/files/usr/bin/bash
+# ==============================================================================
+# agy - Transparent Wrapper with Auto-Switch by GMA (Good Mode AGY)
+# ==============================================================================
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GMA_BIN=""
+
+if [[ -x "$SCRIPT_DIR/gma" ]]; then
+    GMA_BIN="$SCRIPT_DIR/gma"
+elif [[ -x "$HOME/bin/gma" ]]; then
+    GMA_BIN="$HOME/bin/gma"
+elif command -v gma >/dev/null 2>&1; then
+    GMA_BIN="$(command -v gma)"
+fi
+
+if [[ -n "$GMA_BIN" && -x "$GMA_BIN" ]]; then
+    exec "$GMA_BIN" run "$@"
+fi
+
+REAL_AGY="/data/data/com.termux/files/usr/bin/agy"
+if [[ -x "$REAL_AGY" ]]; then
+    exec "$REAL_AGY" "$@"
+fi
+
+echo "Error: Neither GMA nor real 'agy' binary found." >&2
+exit 1
+EOF
+            chmod +x "$wrapper_target"
+            echo -e "${GREEN}✓ Wrapper transparan 'agy' berhasil dipasang ke: ${BOLD}$wrapper_target${NC}"
+            echo -e "Sekarang cukup ketik ${CYAN}agy${NC} seperti biasa, GMA akan otomatis menangani auto-switch kuota tanpa perintah!"
+            ;;
+        uninstall|remove)
+            if [[ -f "$wrapper_target" ]]; then
+                rm -f "$wrapper_target"
+                echo -e "${GREEN}✓ Wrapper $wrapper_target berhasil dicopot.${NC}"
+            else
+                echo -e "${YELLOW}Wrapper $wrapper_target tidak ditemukan.${NC}"
+            fi
+            ;;
+        status|*)
+            echo -e "${BLUE}=== ⚡ Status Transparent Wrapper 'agy' ===${NC}"
+            if [[ -f "$wrapper_target" && -x "$wrapper_target" ]]; then
+                echo -e "Status       : ${GREEN}${BOLD}TERPASANG${NC} ($wrapper_target)"
+                echo -e "Efek         : Mengetik ${CYAN}agy${NC} akan otomatis mengaktifkan auto-switch kuota."
+            else
+                echo -e "Status       : ${YELLOW}BELUM TERPASANG${NC}"
+                echo -e "Pasang dengan: ${CYAN}gma wrapper install${NC}"
+            fi
+            ;;
+    esac
 }
 
 # ------------------------------------------------------------------------------
@@ -1228,11 +1748,29 @@ interactive_menu() {
             cur_str="${GREEN}${BOLD}$current${NC}${extra}"
         fi
 
+        # Daemon status string
+        local d_status="${YELLOW}Nonaktif${NC}"
+        if [[ -f "$DAEMON_PID_FILE" ]]; then
+            local dp
+            dp=$(cat "$DAEMON_PID_FILE" 2>/dev/null || echo "")
+            if [[ -n "$dp" ]] && kill -0 "$dp" 2>/dev/null; then
+                d_status="${GREEN}Aktif (PID: $dp)${NC}"
+            fi
+        fi
+
+        # Wrapper status string
+        local w_status="${YELLOW}Belum Pasang${NC}"
+        if [[ -x "$HOME_DIR/bin/agy" ]]; then
+            w_status="${GREEN}Aktif di ~/bin/agy${NC}"
+        fi
+
         echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
         echo -e "${BLUE}║            🚀 ${BOLD}${APP_NAME} v${VERSION}${NC}${BLUE}                  ║${NC}"
         echo -e "${BLUE}║      Multi-Account Manager & Auto-Switcher for Termux      ║${NC}"
         echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
-        echo -e " Akun Aktif: $cur_str | Tersimpan: ${BOLD}${#accounts[@]}${NC} akun"
+        echo -e " Akun Aktif   : $cur_str | Tersimpan: ${BOLD}${#accounts[@]}${NC} akun"
+        echo -e " Auto-Switch  : ${GREEN}Aktif Penuh (Otomatis Tanpa Perintah)${NC}"
+        echo -e " Daemon Watch : $d_status | Wrapper: $w_status"
         echo -e "------------------------------------------------------------"
         echo -e "  ${CYAN}1)${NC} 📋 Daftar Semua Akun Tersimpan (List)"
         echo -e "  ${CYAN}2)${NC} 🔄 Ganti Akun Aktif (Switch)"
@@ -1241,15 +1779,17 @@ interactive_menu() {
         echo -e "  ${CYAN}5)${NC} ➕ Tambah Akun Baru (Add / Google Auth)"
         echo -e "  ${CYAN}6)${NC} 💾 Simpan Akun Aktif Saat Ini (Save)"
         echo -e "  ${CYAN}7)${NC} 📊 Cek Status & Token (Status / Quota)"
-        echo -e "  ${CYAN}8)${NC} ⚡ Jalankan AGY Mode Proteksi Kuota (gma run)"
-        echo -e "  ${CYAN}9)${NC} 🚀 Jalankan Antigravity CLI Interaktif"
-        echo -e " ${CYAN}10)${NC} 🔔 Uji Coba Notifikasi Termux"
-        echo -e " ${CYAN}11)${NC} 📦 Backup / Export Akun (.tar.gz)"
-        echo -e " ${CYAN}12)${NC} 📥 Restore / Import Akun (.tar.gz)"
-        echo -e " ${CYAN}13)${NC} 🗑️  Hapus Akun Tersimpan (Remove)"
+        echo -e "  ${CYAN}8)${NC} ⚡ Jalankan AGY Mode Auto-Switch Kuota (gma run)"
+        echo -e "  ${CYAN}9)${NC} 🛡️ Kelola Auto-Switch Background Daemon"
+        echo -e " ${CYAN}10)${NC} ⚡ Pasang / Cek Transparent Wrapper 'agy'"
+        echo -e " ${CYAN}11)${NC} 👁️ Live Quota Watcher (Monitor Real-Time)"
+        echo -e " ${CYAN}12)${NC} 🔔 Uji Coba Notifikasi Termux"
+        echo -e " ${CYAN}13)${NC} 📦 Backup / Export Akun (.tar.gz)"
+        echo -e " ${CYAN}14)${NC} 📥 Restore / Import Akun (.tar.gz)"
+        echo -e " ${CYAN}15)${NC} 🗑️  Hapus Akun Tersimpan (Remove)"
         echo -e "  ${CYAN}0)${NC} 🚪 Keluar"
         echo -e "------------------------------------------------------------"
-        echo -n "Pilih menu [0-13]: "
+        echo -n "Pilih menu [0-15]: "
         read -r choice
 
         case "$choice" in
@@ -1314,23 +1854,55 @@ interactive_menu() {
                 read -r -p "Tekan [Enter] untuk kembali..." _
                 ;;
             9)
-                local agy_cmd
-                agy_cmd=$(get_agy_binary || true)
-                if [[ -n "$agy_cmd" ]]; then
-                    "$agy_cmd"
-                else
-                    echo -e "${RED}agy binary tidak ditemukan.${NC}"
-                fi
+                echo ""
+                echo -e "${BLUE}=== 🛡️ Pengaturan Auto-Switch Background Daemon ===${NC}"
+                daemon_status
+                echo ""
+                echo "1) Jalankan Daemon (Start)"
+                echo "2) Hentikan Daemon (Stop)"
+                echo "3) Lihat Log Aktivitas Daemon"
+                echo "0) Kembali"
+                echo -n "Pilihan [0-3]: "
+                read -r d_opt
+                case "$d_opt" in
+                    1) daemon_start ;;
+                    2) daemon_stop ;;
+                    3) echo ""; daemon_log 20 ;;
+                    *) ;;
+                esac
                 echo ""
                 read -r -p "Tekan [Enter] untuk kembali..." _
                 ;;
             10)
                 echo ""
-                test_notification
+                manage_wrapper status
+                echo ""
+                echo "1) Pasang Wrapper ke ~/bin/agy"
+                echo "2) Copot Wrapper dari ~/bin/agy"
+                echo "0) Kembali"
+                echo -n "Pilihan [0-2]: "
+                read -r w_opt
+                case "$w_opt" in
+                    1) manage_wrapper install ;;
+                    2) manage_wrapper uninstall ;;
+                    *) ;;
+                esac
                 echo ""
                 read -r -p "Tekan [Enter] untuk kembali..." _
                 ;;
             11)
+                echo ""
+                watch_log
+                echo ""
+                read -r -p "Tekan [Enter] untuk kembali..." _
+                ;;
+            12)
+                echo ""
+                test_notification
+                echo ""
+                read -r -p "Tekan [Enter] untuk kembali..." _
+                ;;
+            13)
                 echo ""
                 echo -n "Path penyimpanan backup (kosongkan untuk default di ~/): "
                 read -r dest
@@ -1338,7 +1910,7 @@ interactive_menu() {
                 echo ""
                 read -r -p "Tekan [Enter] untuk kembali..." _
                 ;;
-            12)
+            14)
                 echo ""
                 echo -n "Masukkan path file backup (.tar.gz): "
                 read -r src
@@ -1346,7 +1918,7 @@ interactive_menu() {
                 echo ""
                 read -r -p "Tekan [Enter] untuk kembali..." _
                 ;;
-            13)
+            15)
                 echo ""
                 list_accounts
                 echo ""
@@ -1375,40 +1947,42 @@ interactive_menu() {
 # ------------------------------------------------------------------------------
 show_help() {
     echo -e "${BLUE}=== 🚀 ${APP_NAME} v${VERSION} ===${NC}"
-    echo -e "Multi-Account Manager, Auto-Switcher & Enhancer untuk Google Antigravity CLI di Termux"
+    echo -e "Multi-Account Manager, True Auto-Switcher & Enhancer untuk Google Antigravity CLI di Termux"
     echo ""
     echo -e "${BOLD}Penggunaan:${NC}"
     echo -e "  ${CYAN}gma${NC} [command] [options]"
     echo ""
     echo -e "${BOLD}Perintah Utama:${NC}"
     echo -e "  ${GREEN}menu${NC}                     Buka menu interaktif TUI (default jika tanpa argumen)"
+    echo -e "  ${GREEN}run${NC}, ${GREEN}exec${NC} <argumen...>     Jalankan agy dengan auto-switch otomatis tanpa konfirmasi perintah"
+    echo -e "  ${GREEN}daemon${NC} <start|stop|status|log>  Kelola background daemon untuk pemantauan limit kuota real-time"
+    echo -e "  ${GREEN}wrapper${NC} <install|uninstall|status>  Pasang transparent wrapper ~/bin/agy (ketik 'agy' langsung auto-switch)"
+    echo -e "  ${GREEN}watch${NC}                    Pantau log Antigravity secara langsung di terminal"
     echo -e "  ${GREEN}list${NC}, ${GREEN}ls${NC}                 Tampilkan semua akun tersimpan beserta alias & model"
     echo -e "  ${GREEN}current${NC}, ${GREEN}whoami${NC}           Tampilkan akun yang sedang aktif"
     echo -e "  ${GREEN}switch${NC} <id|alias|email>  Ganti akun aktif berdasarkan nomor, alias, atau email"
-    echo -e "  ${GREEN}next${NC}, ${GREEN}rotate${NC}              Auto-rotate ke akun berikutnya (hanya akun bertanda rotate)"
+    echo -e "  ${GREEN}next${NC}, ${GREEN}rotate${NC}              Auto-rotate ke akun berikutnya secara manual"
     echo -e "  ${GREEN}config${NC}, ${GREEN}set${NC} <id|email>     Atur konfigurasi kustom (alias, default model, auto-rotate)"
-    echo -e "  ${GREEN}test-notif${NC}               Uji coba notifikasi status bar Termux"
     echo -e "  ${GREEN}add${NC}                      Tambah akun baru (via proses autentikasi Google)"
     echo -e "  ${GREEN}save${NC}                     Simpan akun aktif saat ini ke profil"
     echo -e "  ${GREEN}remove${NC}, ${GREEN}rm${NC} <target>       Hapus akun tersimpan"
-    echo -e "  ${GREEN}status${NC}, ${GREEN}quota${NC} [--ping]   Cek masa berlaku token, info akun, & ping API"
-    echo -e "  ${GREEN}run${NC}, ${GREEN}exec${NC} <argumen...>     Jalankan agy dengan auto-switch jika limit kuota tercapai"
+    echo -e "  ${GREEN}status${NC}, ${GREEN}quota${NC} [--ping]   Cek masa berlaku token, status daemon, wrapper, & ping API"
+    echo -e "  ${GREEN}test-notif${NC}               Uji coba notifikasi status bar Termux"
+    echo -e "  ${GREEN}setup-hooks${NC}              Pasang konfigurasi native Lifecycle Hook Antigravity"
     echo -e "  ${GREEN}export${NC} [file.tar.gz]     Backup semua profil akun ke file terkompresi"
     echo -e "  ${GREEN}import${NC} <file.tar.gz>     Restore profil akun dari file backup"
+    echo -e "  ${GREEN}raw${NC} <argumen...>         Jalankan agy asli secara langsung tanpa intervensi GMA"
     echo -e "  ${GREEN}version${NC}, ${GREEN}-v${NC}               Tampilkan versi GMA"
     echo -e "  ${GREEN}help${NC}, ${GREEN}-h${NC}                  Tampilkan panduan bantuan ini"
     echo ""
     echo -e "${BOLD}Opsi Global:${NC}"
     echo -e "  ${YELLOW}--no-color${NC}               Nonaktifkan warna ANSI"
     echo ""
-    echo -e "${BOLD}Contoh:${NC}"
-    echo -e "  gma                                  # Buka menu interaktif"
-    echo -e "  gma config 1 --alias Kerja           # Beri label alias pada akun #1"
-    echo -e "  gma config 1 --model 'Gemini 3.1 Pro (High)' # Atur default model"
-    echo -e "  gma switch Kerja                     # Beralih akun langsung via alias"
-    echo -e "  gma next                             # Rotasi akun berikutnya"
-    echo -e "  gma test-notif                       # Tes notifikasi Termux"
-    echo -e "  gma run -p 'Halo agy'                # Eksekusi dengan auto-switch"
+    echo -e "${BOLD}Contoh Auto-Switch Tanpa Perintah:${NC}"
+    echo -e "  gma wrapper install                  # Pasang wrapper: cukup ketik 'agy', auto-switch langsung aktif"
+    echo -e "  gma daemon start                     # Aktifkan daemon pemantau kuota di latar belakang"
+    echo -e "  agy                                  # Sesi agy biasa; saat kuota habis, otomatis beralih akun & resume!"
+    echo -e "  agy -p 'Buatkan skrip bash'          # Batch command; otomatis retry dengan akun lain jika limit"
 }
 
 # ------------------------------------------------------------------------------
@@ -1430,6 +2004,37 @@ case "$cmd" in
     remove|rm|delete) remove_account "${1:-}" ;;
     status|quota|check) status_account "${1:-}" ;;
     run|exec) run_with_autoswitch "$@" ;;
+    raw) 
+        REAL_AGY=$(get_agy_binary)
+        exec "$REAL_AGY" "$@"
+        ;;
+    daemon)
+        sub="${1:-status}"
+        shift || true
+        case "$sub" in
+            start) daemon_start "$@" ;;
+            stop) daemon_stop ;;
+            status) daemon_status ;;
+            log|logs) daemon_log "$@" ;;
+            run) daemon_run ;;
+            *) echo -e "${RED}Opsi daemon tidak valid: $sub (gunakan start|stop|status|log)${NC}"; exit 1 ;;
+        esac
+        ;;
+    watch) watch_log ;;
+    wrapper)
+        sub="${1:-status}"
+        shift || true
+        manage_wrapper "$sub"
+        ;;
+    hook)
+        sub="${1:-stop}"
+        shift || true
+        case "$sub" in
+            stop) hook_stop_handler ;;
+            *) echo "{}" ;;
+        esac
+        ;;
+    setup-hooks|hooks-setup) setup_hooks ;;
     export|backup) export_accounts "${1:-}" ;;
     import|restore) import_accounts "${1:-}" ;;
     version|-v|--version) echo -e "${APP_NAME} v${VERSION} (Termux Edition)" ;;

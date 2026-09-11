@@ -1,0 +1,30 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# ==============================================================================
+# agy - Transparent Wrapper with Auto-Switch by GMA (Good Mode AGY)
+# ==============================================================================
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GMA_BIN=""
+
+if [[ -x "$SCRIPT_DIR/gma" ]]; then
+    GMA_BIN="$SCRIPT_DIR/gma"
+elif [[ -x "$HOME/bin/gma" ]]; then
+    GMA_BIN="$HOME/bin/gma"
+elif command -v gma >/dev/null 2>&1; then
+    GMA_BIN="$(command -v gma)"
+fi
+
+# Route all calls through GMA run with full auto-switch protection
+if [[ -n "$GMA_BIN" && -x "$GMA_BIN" ]]; then
+    exec "$GMA_BIN" run "$@"
+fi
+
+# Fallback: run real agy binary directly if GMA is not found
+REAL_AGY="/data/data/com.termux/files/usr/bin/agy"
+if [[ -x "$REAL_AGY" ]]; then
+    exec "$REAL_AGY" "$@"
+fi
+
+echo "Error: Neither GMA nor real 'agy' binary found." >&2
+exit 1
