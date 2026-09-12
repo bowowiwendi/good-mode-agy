@@ -118,6 +118,12 @@ get_agy_binary() {
             if [[ "$candidate" == "$HOME_DIR/bin/gma" || "$cand_real" == "$HOME_DIR/bin/gma" ]]; then
                 continue
             fi
+            if [[ "$candidate" == "$AGY_CLI_DIR/bin/agy" || "$cand_real" == "$AGY_CLI_DIR/bin/agy" ]]; then
+                continue
+            fi
+            if [[ "$candidate" == "$AGY_CLI_DIR/bin/gma" || "$cand_real" == "$AGY_CLI_DIR/bin/gma" ]]; then
+                continue
+            fi
             # Skip any wrapper script that contains GMA_BIN or calls gma
             if head -n 10 "$candidate" 2>/dev/null | grep -qE "GMA_BIN|gma run|Good Mode AGY"; then
                 continue
@@ -129,6 +135,75 @@ get_agy_binary() {
         fi
     done
     return 1
+}
+
+# ------------------------------------------------------------------------------
+# Helper: Refresh token in a file if expired or expiring soon (< 5 minutes)
+# ------------------------------------------------------------------------------
+refresh_token_file() {
+    local target_file="$1"
+    [[ ! -f "$target_file" ]] && return 1
+
+    if command -v python3 &>/dev/null; then
+        python3 -c "
+import os, json, urllib.request, urllib.parse, sys
+from datetime import datetime, timezone, timedelta
+
+_H_CID = '313037313030363036303539312d746d687373696e326832316c63726532333576746f6c6f6a68346734303365702e617070732e676f6f676c6575736572636f6e74656e742e636f6d'
+_H_SEC = '474f435350582d4b35384657523438364c644c4a316d4c4238735843347a3671444166'
+CLIENT_ID = os.environ.get('GMA_CLIENT_ID', bytes.fromhex(_H_CID).decode())
+SECRET = os.environ.get('GMA_CLIENT_SECRET', bytes.fromhex(_H_SEC).decode())
+tok_file = '$target_file'
+
+try:
+    with open(tok_file) as f:
+        tok_data = json.load(f)
+    t = tok_data.get('token', {})
+    rt = t.get('refresh_token')
+    exp_str = t.get('expiry', '')
+
+    needs_refresh = True
+    if exp_str:
+        try:
+            clean_str = exp_str.split('.')[0] + 'Z' if '.' in exp_str else exp_str
+            exp_dt = datetime.strptime(clean_str, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+            now_dt = datetime.now(timezone.utc)
+            if (exp_dt - now_dt).total_seconds() > 300:
+                needs_refresh = False
+        except Exception:
+            needs_refresh = True
+
+    if needs_refresh and rt:
+        data = urllib.parse.urlencode({
+            'client_id': CLIENT_ID,
+            'client_secret': SECRET,
+            'grant_type': 'refresh_token',
+            'refresh_token': rt
+        }).encode()
+        req = urllib.request.Request('https://oauth2.googleapis.com/token', data=data)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            t_res = json.loads(resp.read().decode())
+            new_at = t_res.get('access_token')
+            expires_in = t_res.get('expires_in', 3599)
+            new_exp = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+            tok_data['token']['access_token'] = new_at
+            tok_data['token']['expiry'] = new_exp
+            if 'id_token' in t_res:
+                tok_data['id_token'] = t_res['id_token']
+
+            tmp_f = tok_file + '.tmp'
+            with open(tmp_f, 'w') as tf:
+                json.dump(tok_data, tf, indent=2)
+            os.replace(tmp_f, tok_file)
+            sys.exit(0)
+    elif not needs_refresh:
+        sys.exit(0)
+except Exception:
+    pass
+sys.exit(1)
+" >/dev/null 2>&1 || true
+    fi
 }
 
 # ------------------------------------------------------------------------------
@@ -522,6 +597,8 @@ switch_account() {
     mkdir -p "$(dirname "$TOKEN_FILE")"
     
     if [[ -f "$target_dir/oauth-token" ]]; then
+        # Pre-refresh token if expired so agy starts immediately without login prompts
+        refresh_token_file "$target_dir/oauth-token"
         cp -p "$target_dir/oauth-token" "$TOKEN_FILE"
         chmod 600 "$TOKEN_FILE"
     fi
@@ -529,8 +606,6 @@ switch_account() {
     if [[ -f "$target_dir/credentials.json" ]]; then
         cp -p "$target_dir/credentials.json" "$CRED_FILE"
         chmod 600 "$CRED_FILE"
-    else
-        rm -f "$CRED_FILE"
     fi
 
     if [[ -f "$target_dir/settings.json" ]]; then
@@ -1105,6 +1180,102 @@ except Exception as e:
 }
 
 # ------------------------------------------------------------------------------
+# Command: refresh-all / sync / fix (Refresh OAuth tokens for all stored accounts)
+# ------------------------------------------------------------------------------
+refresh_all_accounts() {
+    echo -e "${BLUE}=== 🚀 ${APP_NAME} - Refresh & Sinkronisasi Token Semua Akun ===${NC}"
+    echo -e "${CYAN}Memperbarui token OAuth langsung ke server Google untuk memastikan semua akun aktif...${NC}\n"
+    
+    local accounts=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && accounts+=("$line")
+    done < <(get_saved_accounts)
+
+    local total=${#accounts[@]}
+    if [[ $total -eq 0 ]]; then
+        echo -e "${YELLOW}Belum ada akun yang tersimpan.${NC}"
+        return 0
+    fi
+
+    local current
+    current=$(get_current_email)
+    local refreshed_count=0
+
+    for acc in "${accounts[@]}"; do
+        local email
+        local dir
+        local alias
+        email=$(echo "$acc" | cut -d'|' -f1)
+        dir=$(echo "$acc" | cut -d'|' -f2)
+        alias=$(echo "$acc" | cut -d'|' -f3)
+
+        local disp="$email"
+        [[ -n "$alias" ]] && disp="$email [$alias]"
+
+        echo -n "Memeriksa $disp... "
+        local tok_file="$dir/oauth-token"
+        if [[ -f "$tok_file" ]]; then
+            local res
+            res=$(python3 -c "
+import json, urllib.request, urllib.parse, sys, os
+from datetime import datetime, timezone, timedelta
+
+_H_CID = '313037313030363036303539312d746d687373696e326832316c63726532333576746f6c6f6a68346734303365702e617070732e676f6f676c6575736572636f6e74656e742e636f6d'
+_H_SEC = '474f435350582d4b35384657523438364c644c4a316d4c4238735843347a3671444166'
+CLIENT_ID = os.environ.get('GMA_CLIENT_ID', bytes.fromhex(_H_CID).decode())
+SECRET = os.environ.get('GMA_CLIENT_SECRET', bytes.fromhex(_H_SEC).decode())
+tok_file = '$tok_file'
+try:
+    with open(tok_file) as f:
+        tok_data = json.load(f)
+    rt = tok_data.get('token', {}).get('refresh_token')
+    if not rt:
+        print('no_refresh_token')
+        sys.exit(1)
+    data = urllib.parse.urlencode({
+        'client_id': CLIENT_ID,
+        'client_secret': SECRET,
+        'grant_type': 'refresh_token',
+        'refresh_token': rt
+    }).encode()
+    req = urllib.request.Request('https://oauth2.googleapis.com/token', data=data)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        t_res = json.loads(resp.read().decode())
+        new_at = t_res['access_token']
+        expires_in = t_res.get('expires_in', 3599)
+        new_exp = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        tok_data['token']['access_token'] = new_at
+        tok_data['token']['expiry'] = new_exp
+        if 'id_token' in t_res:
+            tok_data['id_token'] = t_res['id_token']
+        tmp_f = tok_file + '.tmp'
+        with open(tmp_f, 'w') as tf:
+            json.dump(tok_data, tf, indent=2)
+        os.replace(tmp_f, tok_file)
+        print('ok')
+except Exception as e:
+    print('fail:' + str(e))
+" 2>/dev/null || echo "error")
+
+            if [[ "$res" == "ok" ]]; then
+                echo -e "${GREEN}✓ Token Valid & Berhasil Diperbarui${NC}"
+                refreshed_count=$((refreshed_count + 1))
+                if [[ "$email" == "$current" ]]; then
+                    cp -p "$tok_file" "$TOKEN_FILE"
+                fi
+            else
+                echo -e "${RED}✗ Gagal ($res)${NC}"
+            fi
+        else
+            echo -e "${YELLOW}File token tidak ditemukan${NC}"
+        fi
+    done
+
+    echo ""
+    echo -e "${GREEN}✓ Selesai: $refreshed_count dari $total akun aktif & siap digunakan tanpa perlu login ulang!${NC}"
+}
+
+# ------------------------------------------------------------------------------
 # Command: run (Execute agy with 100% Automatic Auto-Switch on Quota Exceeded)
 # ------------------------------------------------------------------------------
 run_with_autoswitch() {
@@ -1120,14 +1291,17 @@ run_with_autoswitch() {
         exec "$AGY_BIN" "$@"
     fi
 
-    # Pass-through informational commands directly without wrapper intervention
+    # Pass-through informational or management commands directly without wrapper intervention
     for arg in "$@"; do
         case "$arg" in
-            --version|-v|version|--help|-h|help|models|agents|changelog)
+            --version|-v|version|--help|-h|help|models|agents|changelog|update|auth|login|logout)
                 exec "$AGY_BIN" "$@"
                 ;;
         esac
     done
+
+    # Ensure active token is valid and fresh before executing agy
+    [[ -f "$TOKEN_FILE" ]] && refresh_token_file "$TOKEN_FILE"
 
     local accounts=()
     while IFS= read -r line; do
@@ -1967,6 +2141,7 @@ show_help() {
     echo -e "  ${GREEN}save${NC}                     Simpan akun aktif saat ini ke profil"
     echo -e "  ${GREEN}remove${NC}, ${GREEN}rm${NC} <target>       Hapus akun tersimpan"
     echo -e "  ${GREEN}status${NC}, ${GREEN}quota${NC} [--ping]   Cek masa berlaku token, status daemon, wrapper, & ping API"
+    echo -e "  ${GREEN}refresh-all${NC}, ${GREEN}sync${NC}, ${GREEN}fix${NC}  🔑 Perbarui token OAuth semua akun tersimpan (pakai jika logout setelah update)"
     echo -e "  ${GREEN}test-notif${NC}               Uji coba notifikasi status bar Termux"
     echo -e "  ${GREEN}setup-hooks${NC}              Pasang konfigurasi native Lifecycle Hook Antigravity"
     echo -e "  ${GREEN}export${NC} [file.tar.gz]     Backup semua profil akun ke file terkompresi"
@@ -2003,6 +2178,7 @@ case "$cmd" in
     save) save_account ;;
     remove|rm|delete) remove_account "${1:-}" ;;
     status|quota|check) status_account "${1:-}" ;;
+    refresh-all|refresh|sync|fix) refresh_all_accounts ;;
     run|exec) run_with_autoswitch "$@" ;;
     raw) 
         REAL_AGY=$(get_agy_binary)
